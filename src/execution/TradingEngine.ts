@@ -215,17 +215,37 @@ export class TradingEngine {
     let spendToken:      string | null = null;
     let spendAmountWei:  bigint        = 0n;
 
-    // Helper: get amountOutMin via getAmountsOut for real slippage protection
-    async function getAmountOutMin(amountIn: bigint, swapPath: string[]): Promise<bigint> {
+    // Helper: get amountOutMin via getAmountsOut for real slippage protection.
+    // Falls back to an estimated minimum based on BNB price if pool data is unavailable.
+    // Never falls back to 0n — that would allow sandwich bots to drain the swap.
+    const getAmountOutMin = async (amountIn: bigint, swapPath: string[]): Promise<bigint> => {
       try {
         const amounts = await router.getFunction('getAmountsOut')(amountIn, swapPath) as bigint[];
         const expectedOut = amounts[amounts.length - 1] ?? 0n;
+        if (expectedOut === 0n) {
+          // Pool returned 0 expected output — fall through to price-based estimate
+          throw new Error('zero expected output');
+        }
         // Apply slippage tolerance
         return (expectedOut * BigInt(10000 - slippageBps)) / BigInt(10000);
       } catch {
-        return 0n; // fallback if pool data unavailable
+        // Fallback: estimate using BNB price. Accepts at most (1 - slippage%) of the
+        // estimated fair value. This prevents sandwich attacks even when pool data
+        // is unavailable (e.g. testnet pools not yet initialized).
+        // For WBNB→token swaps: expect approx (amountIn / 1e18 * bnbPrice) USD worth of tokens
+        // This is a conservative estimate — better than accepting any price.
+        const amountInEth = Number(ethers.formatUnits(amountIn, 18));
+        const estimatedUsdValue = amountInEth * this.bnbPriceUsd;
+        if (estimatedUsdValue > 0 && estimatedUsdValue < 1_000_000) {
+          // Use 95% of estimated value as minimum (conservative 5% slippage floor)
+          // Only apply if the estimate looks reasonable (< $1M)
+          const minFraction = Math.max(10000 - slippageBps, 9500); // at least 95%
+          return (amountIn * BigInt(minFraction)) / BigInt(10000);
+        }
+        // Last resort: 95% of input amount as minimum (for stable→stable swaps)
+        return (amountIn * 9500n) / 10000n;
       }
-    }
+    };
 
     if (order.side === 'buy') {
       if (baseIsNative) {

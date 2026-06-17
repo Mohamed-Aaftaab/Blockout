@@ -117,7 +117,7 @@ export interface NetworkConfig {
 export interface VenueConfig {
   pancakeswapRouter: string;
   bscPerpsContract:  string;
-  pancakeV3Factory:  string;
+  // pancakeV3Factory removed — V2 factory hardcoded in TradingEngine (immutable on-chain)
 }
 
 export interface AdaptiveConfig {

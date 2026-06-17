@@ -65,7 +65,6 @@ export class ConfigurationService {
       venue: {
         pancakeswapRouter: process.env['PANCAKESWAP_ROUTER'] ?? '',
         bscPerpsContract:  process.env['BSC_PERPS_CONTRACT'] ?? '',
-        pancakeV3Factory:  process.env['PANCAKE_V3_FACTORY'],
       },
 
       risk: {

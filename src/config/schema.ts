@@ -87,7 +87,8 @@ const PoolConfigSchema = z.object({
 const VenueConfigSchema = z.object({
   pancakeswapRouter: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
   bscPerpsContract:  z.string().regex(/^0x[0-9a-fA-F]{40}$/),
-  pancakeV3Factory:  z.string().default('0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865'),
+  // pancakeV3Factory removed — V2 factory addresses are hardcoded in TradingEngine
+  // (immutable on-chain, no need to configure)
 });
 
 const AdaptiveConfigSchema = z.object({
