@@ -65,8 +65,10 @@ export class PoolAnalyzer {
 
     // Derive plausible 24h metrics from on-chain reserves.
     // These are estimates only — real volume/tx data would require a subgraph/API.
-    // The 5% turnover and per-$1000 tx estimates are conservative baselines.
-    const volume24h    = totalReserveUsd * 0.05;         // ~5% daily turnover
+    // Using 4% daily turnover (not 5%) so the vol/reserve filter (default 5%) can actually
+    // reject low-activity pools — if we estimated 5% and the threshold is also 5%, the
+    // check would always pass as dead code.
+    const volume24h    = totalReserveUsd * 0.04;         // ~4% daily turnover estimate
     const txCount24h   = Math.max(                        // at least 1 tx per $500 reserve
       Math.floor(totalReserveUsd / 500),
       totalReserveUsd >= 1000 ? 1 : 0,

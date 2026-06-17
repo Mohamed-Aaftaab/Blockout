@@ -1,4 +1,3 @@
-import { z } from 'zod';
 import { makeLogger } from '../utils/logger';
 import { ConfigSchema } from './schema';
 import type { Config } from '../types/index';
@@ -187,9 +186,5 @@ export class ConfigurationService {
       );
     }
     return this.config;
-  }
-
-  getSchema(): z.ZodType<Config> {
-    return ConfigSchema as unknown as z.ZodType<Config>;
   }
 }

@@ -26,10 +26,11 @@ const PANCAKE_PAIR_ABI = [
   'function token1() external view returns (address)',
 ];
 
-// ERC-20 ABI — needed for approve() before token swaps
+// ERC-20 ABI — needed for approve(), allowance(), and balanceOf() calls
 const ERC20_ABI = [
   'function approve(address spender, uint256 amount) external returns (bool)',
   'function allowance(address owner, address spender) external view returns (uint256)',
+  'function balanceOf(address owner) external view returns (uint256)',
 ];
 
 // ─── Token addresses ─────────────────────────────────────────────────────────
@@ -532,11 +533,18 @@ export class TradingEngine {
   async getCurrentPrice(pair: string): Promise<number> {
     try {
       const reserves = await this.getPoolReserves(pair);
-      const [baseSymbol, quoteSymbol] = pair.split('/');
-      const r0 = Number(ethers.formatUnits(reserves.reserve0, getTokenDecimals(baseSymbol  ?? 'BNB')));
-      const r1 = Number(ethers.formatUnits(reserves.reserve1, getTokenDecimals(quoteSymbol ?? 'USDT')));
+      // Use reserves.token0Symbol/token1Symbol (on-chain sorted order) not pair string order
+      // because PancakeSwap sorts tokens by address when creating pairs.
+      const r0 = Number(ethers.formatUnits(reserves.reserve0, getTokenDecimals(reserves.token0Symbol)));
+      const r1 = Number(ethers.formatUnits(reserves.reserve1, getTokenDecimals(reserves.token1Symbol)));
       if (r0 === 0) return 0;
-      return r1 / r0;
+
+      // r1/r0 gives "token1 per token0". We need "quote per base" (e.g. USDT per BNB).
+      // If token0 is the base (BNB) and token1 is the quote (USDT), price = r1/r0.
+      // If the on-chain order is reversed (USDT=token0, BNB=token1), price = r0/r1.
+      const [baseSymbol] = pair.split('/');
+      const baseIsToken0 = reserves.token0Symbol === (baseSymbol ?? 'BNB');
+      return baseIsToken0 ? r1 / r0 : r0 / r1;
     } catch {
       return 0;
     }
@@ -582,10 +590,6 @@ export class TradingEngine {
 
   // ─── ERC-20 balance helpers ─────────────────────────────────────────────────
 
-  private readonly ERC20_BALANCE_ABI = [
-    'function balanceOf(address owner) external view returns (uint256)',
-  ];
-
   /**
    * Returns the ERC-20 token balance of walletAddress in token-native units (wei).
    * Returns 0n on any failure so callers can gracefully handle missing tokens.
@@ -593,7 +597,7 @@ export class TradingEngine {
   async getERC20Balance(tokenAddress: string, walletAddress: string): Promise<bigint> {
     try {
       const provider = this.requireProvider();
-      const erc20    = new ethers.Contract(tokenAddress, this.ERC20_BALANCE_ABI, provider);
+      const erc20    = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
       return await erc20.getFunction('balanceOf')(walletAddress) as bigint;
     } catch {
       return 0n;

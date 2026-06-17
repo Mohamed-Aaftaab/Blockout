@@ -46,6 +46,8 @@ export class MidBattleScalpingStrategy implements IStrategy {
       pair:      signal.pair,
       type:      'twap',
       side:      'buy',
+      // Size is a placeholder — executeSignalPipeline always overrides with risk-managed size.
+      // Using positionSizeUsd here only as the strategy's minimum intent signal.
       size:      cfg.scalping.positionSizeUsd,
       venue:     'pancakeswap',
       slippage:  cfg.slippage.defaultPct,

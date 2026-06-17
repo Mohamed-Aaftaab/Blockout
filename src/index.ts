@@ -95,10 +95,14 @@ async function bootstrap(): Promise<void> {
   regimeDet.start();
   await riskMgr.start();
 
-  // Restore persisted drawdown baseline so it survives restarts correctly
-  if (currentState.drawdownBaseline > 0) {
+  // Restore persisted drawdown baseline ONLY when start() found an empty wallet (baseline=0).
+  // If the wallet is funded, start() already set the correct live baseline — don't overwrite it
+  // with a potentially stale persisted value that would trigger a false drawdown alarm.
+  if (riskMgr.getDrawdownBaseline() === 0 && currentState.drawdownBaseline > 0) {
     riskMgr.restoreDrawdownBaseline(currentState.drawdownBaseline);
-    logger.info('Drawdown baseline restored from persisted state', { baseline: currentState.drawdownBaseline });
+    logger.info('Drawdown baseline restored from persisted state (wallet was empty at start)', {
+      baseline: currentState.drawdownBaseline,
+    });
   }
 
   // ── Live position registry — declared early so step 7 recovery can populate it ──
@@ -191,7 +195,7 @@ async function bootstrap(): Promise<void> {
     return hhmm >= tradingHoursStart || hhmm <= tradingHoursEnd;
   }
 
-  bus.on('strategy:signal', ({ signal, order: strategyOrder }) => {
+  bus.on('strategy:signal', ({ signal, strategy: strategyName, order: strategyOrder }) => {
     // Enforce trading hours window
     if (!isWithinTradingHours()) {
       logger.debug('Signal skipped: outside trading hours', { pair: signal.pair, tradingHoursStart: cfg.tradingHoursStart, tradingHoursEnd: cfg.tradingHoursEnd });
@@ -204,7 +208,7 @@ async function bootstrap(): Promise<void> {
     }
     pipelineInProgress.add(signal.pair);
     // Pass the resolved order from the strategy so side/size/type are correct
-    void executeSignalPipeline(signal, strategyOrder).finally(() => {
+    void executeSignalPipeline(signal, strategyOrder, strategyName).finally(() => {
       pipelineInProgress.delete(signal.pair);
     });
   });
@@ -220,7 +224,7 @@ async function bootstrap(): Promise<void> {
   // ─────────────────────────────────────────────────────────────────────────
   // Full order execution pipeline
   // ─────────────────────────────────────────────────────────────────────────
-  async function executeSignalPipeline(signal: TradingSignal, strategyOrder: Order): Promise<void> {
+  async function executeSignalPipeline(signal: TradingSignal, strategyOrder: Order, strategyName: string): Promise<void> {
     const signalTimestamp = Date.now();
     try {
       // 1. Pool health check
@@ -316,7 +320,9 @@ async function bootstrap(): Promise<void> {
         stopLoss,
         takeProfit,
         leverage:   1,
-        strategy:   signal.strategy,
+        // Use the actual strategy name emitted from StrategyManager, not signal.strategy
+        // which is always 'composite' for the aggregated composite signal.
+        strategy:   strategyName,
         venue:      validOrder.venue,
         openedAt:   Date.now(),
         txHash:     firstTx?.hash ?? '0x',
