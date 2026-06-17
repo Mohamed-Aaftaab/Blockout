@@ -3,7 +3,6 @@ import * as path from 'path';
 import { createLogger, transports, format } from 'winston';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
-import type { StateManager }         from '../state/StateManager';
 import type {
   TradeRecord, PerformanceMetrics, PairMetrics,
   VenueMetrics, StrategyMetrics, Venue,
@@ -16,7 +15,6 @@ const logger = createLogger({
 });
 
 export class AnalyticsEngine {
-  private readonly stateMgr: StateManager;
   private readonly config:   ConfigurationService;
   private readonly bus:      EventBus;
 
@@ -25,8 +23,9 @@ export class AnalyticsEngine {
   private metricsInterval: NodeJS.Timeout | null = null;
   private latencyInterval: NodeJS.Timeout | null = null;
 
-  constructor(stateManager: StateManager, config: ConfigurationService, bus: EventBus) {
-    this.stateMgr = stateManager;
+  // stateManager parameter kept for API compatibility but not used internally
+  // analytics persists via its own file write (analyticsFilePath config)
+  constructor(_stateManager: unknown, config: ConfigurationService, bus: EventBus) {
     this.config   = config;
     this.bus      = bus;
   }

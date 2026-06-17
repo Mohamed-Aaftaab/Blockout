@@ -118,7 +118,8 @@ export class ExecutionService {
   }
 
   async awaitConfirmation(txHash: string, timeoutMs: number): Promise<Result<Transaction, ExecutionError>> {
-    const provider = (this.engine as unknown as { provider: ethers.JsonRpcProvider | null }).provider;
+    // Use public getProvider() instead of unsafe private field cast
+    const provider = this.engine.getProvider();
     const start    = Date.now();
     const pollMs   = 2000;
 
@@ -195,7 +196,8 @@ export class ExecutionService {
   private async signAndBroadcast(tx: Transaction, gasPrice: number): Promise<string> {
     if (!this.wallet) throw new Error('Wallet not initialized');
 
-    const provider = (this.engine as unknown as { provider: ethers.JsonRpcProvider }).provider;
+    // Use public getProvider() instead of unsafe private field cast
+    const provider = this.engine.getProvider();
     if (!provider) throw new Error('Provider not initialized');
 
     const signer      = this.wallet.connect(provider);

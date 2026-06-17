@@ -120,6 +120,13 @@ export class RiskManager {
   resetCircuitBreaker(): void {
     this.circuitBreakerActive = false;
     logger.info('Circuit breaker reset');
+    // Reset drawdown baseline to current portfolio so we measure from now
+    void this.engine.getPortfolioValue().then(usd => {
+      if (usd > 0) {
+        this.drawdownBaseline = usd;
+        logger.info('Drawdown baseline reset after circuit breaker recovery', { newBaseline: usd });
+      }
+    });
   }
 
   async checkDrawdown(): Promise<void> {

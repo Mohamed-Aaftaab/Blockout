@@ -61,6 +61,9 @@ async function bootstrap(): Promise<void> {
     marketData.start(),
   ]);
 
+  // Wire MarketDataService to TradingEngine so CMC BNB price is pushed for portfolio valuation
+  marketData.setTradingEngine(tradingEngine);
+
   // ── [5] Health monitor ────────────────────────────────────────────────────
   const health = new HealthMonitor(configSvc, bus);
   health.start();
@@ -220,6 +223,15 @@ async function bootstrap(): Promise<void> {
       // 5. Record the open position
       const firstTx    = txResults[0];
       const entryPrice = await tradingEngine.getCurrentPrice(signal.pair);
+
+      // Guard: if entry price is 0 (pool unavailable), do NOT open a position
+      // A zero entry price would create SL=0 which triggers TP immediately
+      if (entryPrice <= 0) {
+        logger.error('Entry price is zero — aborting position open to prevent immediate SL/TP trigger', {
+          pair: signal.pair,
+        });
+        return;
+      }
 
       // SL/TP directions are correct for both buy and sell:
       // Buy:  SL below entry, TP above entry

@@ -5,6 +5,7 @@ import type { EventBus } from '../events/EventBus';
 import type {
   MarketData, OHLCVCandle, TechnicalIndicators, OnChainMetrics,
 } from '../types/index';
+import type { TradingEngine } from '../execution/TradingEngine';
 import { withRetry } from '../utils/backoff';
 
 const logger = createLogger({
@@ -71,11 +72,18 @@ export class MarketDataService {
   private readonly athMap:     Map<string, number>        = new Map();
   private readonly intervals:  NodeJS.Timeout[]           = [];
   private readonly failCounts: Map<string, number>        = new Map();
+  // Optional reference to TradingEngine so we can push CMC BNB price for portfolio valuation
+  private tradingEngine: TradingEngine | null             = null;
 
   constructor(config: ConfigurationService, bus: EventBus) {
     this.config = config;
     this.bus    = bus;
     this.http   = axios.create({ baseURL: CMC_BASE, timeout: 15_000 });
+  }
+
+  /** Wire the TradingEngine so MarketDataService can push accurate BNB price */
+  setTradingEngine(engine: TradingEngine): void {
+    this.tradingEngine = engine;
   }
 
   async start(): Promise<void> {
@@ -126,6 +134,12 @@ export class MarketDataService {
       // Update ATH
       const currentATH = this.athMap.get(pair) ?? 0;
       if (quote.price > currentATH) this.athMap.set(pair, quote.price);
+
+      // Push BNB price to TradingEngine for accurate portfolio valuation
+      // (avoids relying on pool reserves which give price=1 on testnet fallback)
+      if (pair === 'BNB/USDT' && quote.price > 0 && this.tradingEngine !== null) {
+        this.tradingEngine.setBnbPrice(quote.price);
+      }
 
       const data: MarketData = {
         pair,

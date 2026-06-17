@@ -9,7 +9,7 @@ import type { MarketDataService } from './MarketDataService';
 import { uuid } from '../utils/uuid';
 
 const logger = createLogger({
-  level: 'debug',
+  level: process.env['LOG_LEVEL'] ?? 'info',
   format: format.combine(format.timestamp(), format.json()),
   transports: [new transports.Console()],
 });
