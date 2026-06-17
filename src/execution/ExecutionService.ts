@@ -64,17 +64,27 @@ export class ExecutionService {
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        // Build the transaction (generates real calldata)
-        const txResult = await this.engine.routeOrder({ ...order, slippage });
-        if (!txResult.ok) throw new Error(txResult.error.message);
+        // Build full swap plan including any required ERC-20 approval
+        const plan = await this.engine.buildSwapPlan({ ...order, slippage });
 
-        // Sign and broadcast using the calldata from TradingEngine
-        const signedHash = await this.signAndBroadcast(txResult.value, gasPrice);
-        this.bus.emit('execution:submitted', { txHash: signedHash, orderId: order.id, gasPrice });
-        logger.info('Transaction submitted', { txHash: signedHash, orderId: order.id, venue: order.venue, gasPrice });
+        // Step 1: Send ERC-20 approval if needed (before the swap)
+        if (plan.approveTx !== null) {
+          logger.info('Sending ERC-20 approve transaction', { token: plan.approveTx.to });
+          const approveHash = await this.sendRawTx(plan.approveTx.to, plan.approveTx.calldata, plan.approveTx.value, gasPrice, 100_000);
+          const approveConfirm = await this.awaitConfirmation(approveHash, 60_000);
+          if (!approveConfirm.ok) {
+            logger.error('Approval tx failed', { error: approveConfirm.error.message });
+            return approveConfirm;
+          }
+          logger.info('ERC-20 approval confirmed', { txHash: approveHash });
+        }
 
-        // Wait for on-chain confirmation
-        const confirmed = await this.awaitConfirmation(signedHash, cfg.txTimeoutSec * 1000);
+        // Step 2: Send the swap transaction
+        const swapHash = await this.sendRawTx(plan.swapTx.to, plan.swapTx.calldata, plan.swapTx.value, gasPrice, plan.swapTx.gasLimit);
+        this.bus.emit('execution:submitted', { txHash: swapHash, orderId: order.id, gasPrice });
+        logger.info('Swap submitted', { txHash: swapHash, orderId: order.id, venue: order.venue, gasPrice });
+
+        const confirmed = await this.awaitConfirmation(swapHash, cfg.txTimeoutSec * 1000);
         if (!confirmed.ok) return confirmed;
 
         return ok({ ...confirmed.value, orderId: order.id, gasPrice });
@@ -105,11 +115,18 @@ export class ExecutionService {
 
   async executeChunk(chunk: Order, gasPrice: number): Promise<Result<Transaction, ExecutionError>> {
     try {
-      const txResult = await this.engine.routeOrder(chunk);
-      if (!txResult.ok) throw new Error(txResult.error.message);
       const actualGasPrice = gasPrice > 0 ? gasPrice : await this.gasOptimizer.getOptimalGasPrice();
-      const signedHash = await this.signAndBroadcast(txResult.value, actualGasPrice);
-      const confirmed  = await this.awaitConfirmation(signedHash, 120_000);
+      const plan = await this.engine.buildSwapPlan(chunk);
+
+      // Send approval if needed
+      if (plan.approveTx !== null) {
+        const approveHash = await this.sendRawTx(plan.approveTx.to, plan.approveTx.calldata, plan.approveTx.value, actualGasPrice, 100_000);
+        const approveConfirm = await this.awaitConfirmation(approveHash, 60_000);
+        if (!approveConfirm.ok) return approveConfirm;
+      }
+
+      const swapHash = await this.sendRawTx(plan.swapTx.to, plan.swapTx.calldata, plan.swapTx.value, actualGasPrice, plan.swapTx.gasLimit);
+      const confirmed = await this.awaitConfirmation(swapHash, 120_000);
       if (!confirmed.ok) return confirmed;
       return ok({ ...confirmed.value, orderId: chunk.id, gasPrice: actualGasPrice });
     } catch (e) {
@@ -192,26 +209,20 @@ export class ExecutionService {
     return this.engine.getPortfolioValue(this.wallet.address);
   }
 
-  // Signs and broadcasts the transaction using real calldata from TradingEngine
-  private async signAndBroadcast(tx: Transaction, gasPrice: number): Promise<string> {
+  // Sends a raw transaction (approve or swap) and returns the tx hash
+  private async sendRawTx(
+    to:       string,
+    calldata: string,
+    value:    bigint,
+    gasPrice: number,
+    gasLimit: number,
+  ): Promise<string> {
     if (!this.wallet) throw new Error('Wallet not initialized');
-
-    // Use public getProvider() instead of unsafe private field cast
     const provider = this.engine.getProvider();
     if (!provider) throw new Error('Provider not initialized');
-
     const signer      = this.wallet.connect(provider);
     const gasPriceWei = ethers.parseUnits(gasPrice.toFixed(9), 'gwei');
-
-    // Use the real calldata and value built by TradingEngine
-    const sentTx = await signer.sendTransaction({
-      to:       tx.to,
-      data:     tx.calldata,  // ← real swap calldata, not '0x'
-      value:    tx.value,     // ← real BNB value for native swaps
-      gasPrice: gasPriceWei,
-      gasLimit: tx.gasLimit,
-    });
-
+    const sentTx = await signer.sendTransaction({ to, data: calldata, value, gasPrice: gasPriceWei, gasLimit });
     return sentTx.hash;
   }
 

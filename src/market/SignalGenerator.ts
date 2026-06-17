@@ -28,6 +28,10 @@ const SIGNAL_TYPE_WEIGHTS: Record<SignalType, number> = {
   composite:          1.00,
 };
 
+// Price-momentum fallback thresholds — fires even without CMC Pro indicators
+const MOMENTUM_DROP_PCT = 2.0; // buy signal when price drops >= 2% in last candle period
+const MOMENTUM_RISE_PCT = 2.0; // sell signal when price rises >= 2% in last candle period
+
 export class SignalGenerator {
   private readonly marketData: MarketDataService;
   private readonly config:     ConfigurationService;
@@ -42,15 +46,18 @@ export class SignalGenerator {
   generateSignals(pair: string, data: MarketData): TradingSignal[] {
     const signals: TradingSignal[] = [];
 
-    const rsi  = this.computeRSISignal(data.indicators, pair, data.onChain);
-    const macd = this.computeMACDSignal(data.indicators, pair, data.onChain);
-    const bb   = this.computeBollingerSignal(data.indicators, pair, data.price, data.onChain);
-    const whal = this.computeWhaleSignal(data.onChain, pair, data.indicators);
+    const rsi      = this.computeRSISignal(data.indicators, pair, data.onChain);
+    const macd     = this.computeMACDSignal(data.indicators, pair, data.onChain);
+    const bb       = this.computeBollingerSignal(data.indicators, pair, data.price, data.onChain);
+    const whal     = this.computeWhaleSignal(data.onChain, pair, data.indicators);
+    // Price momentum: fires even when CMC indicator endpoints are unavailable (free tier)
+    const momentum = this.computePriceMomentumSignal(data, pair);
 
-    if (rsi  !== null) signals.push(rsi);
-    if (macd !== null) signals.push(macd);
-    if (bb   !== null) signals.push(bb);
-    if (whal !== null) signals.push(whal);
+    if (rsi      !== null) signals.push(rsi);
+    if (macd     !== null) signals.push(macd);
+    if (bb       !== null) signals.push(bb);
+    if (whal     !== null) signals.push(whal);
+    if (momentum !== null) signals.push(momentum);
 
     return signals;
   }
@@ -174,6 +181,33 @@ export class SignalGenerator {
     if (onChain.exchangeInflow24h > cfg.exchangeInflowUsd) {
       const conf = Math.min(onChain.exchangeInflow24h / (cfg.exchangeInflowUsd * 2), 1.0);
       return this.buildSignal('exchange_inflow', 'sell', conf, 'onchain', pair, indicators, onChain, regime);
+    }
+    return null;
+  }
+
+  private computePriceMomentumSignal(
+    data: MarketData,
+    pair: string,
+  ): TradingSignal | null {
+    // Requires at least 2 candles to compute price change
+    if (data.candles.length < 2) return null;
+
+    const latest = data.candles[data.candles.length - 1];
+    const prev   = data.candles[data.candles.length - 2];
+    if (latest === undefined || prev === undefined || prev.close === 0) return null;
+
+    const changePct = ((latest.close - prev.close) / prev.close) * 100;
+    const regime    = this.getDefaultRegime();
+
+    if (changePct <= -MOMENTUM_DROP_PCT) {
+      // Price dropped significantly — buy the dip
+      const conf = Math.min(Math.abs(changePct) / (MOMENTUM_DROP_PCT * 3), 1.0);
+      return this.buildSignal('rsi_oversold', 'buy', conf, 'momentum', pair, data.indicators, data.onChain, regime);
+    }
+    if (changePct >= MOMENTUM_RISE_PCT) {
+      // Price rose significantly — consider selling
+      const conf = Math.min(changePct / (MOMENTUM_RISE_PCT * 3), 1.0);
+      return this.buildSignal('rsi_overbought', 'sell', conf, 'momentum', pair, data.indicators, data.onChain, regime);
     }
     return null;
   }

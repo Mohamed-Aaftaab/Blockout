@@ -55,14 +55,14 @@ async function bootstrap(): Promise<void> {
   const executionSvc  = new ExecutionService(tradingEngine, gasOptimizer, configSvc, bus);
   const marketData    = new MarketDataService(configSvc, bus);
 
+  // Wire BEFORE start() so the very first CMC poll pushes BNB price
+  marketData.setTradingEngine(tradingEngine);
+
   await Promise.all([
     tradingEngine.initialize(),
     executionSvc.initialize(),
     marketData.start(),
   ]);
-
-  // Wire MarketDataService to TradingEngine so CMC BNB price is pushed for portfolio valuation
-  marketData.setTradingEngine(tradingEngine);
 
   // ── [5] Health monitor ────────────────────────────────────────────────────
   const health = new HealthMonitor(configSvc, bus);
