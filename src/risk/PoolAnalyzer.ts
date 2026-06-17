@@ -41,7 +41,31 @@ export class PoolAnalyzer {
 
     const reserve0Num = Number(ethers.formatUnits(reserves.reserve0, token0Dec));
     const reserve1Num = Number(ethers.formatUnits(reserves.reserve1, token1Dec));
-    const totalReserveUsd = reserve0Num + reserve1Num;
+
+    // Convert each side to USD using BNB price for BNB/WBNB sides.
+    // For stablecoin sides (USDT/USDC) the amount already equals USD value (1:1 approx).
+    // For non-stable, non-BNB tokens we can't determine USD without extra oracle calls,
+    // so we use the BNB side * 2 as the total (AMM pools are balanced by value).
+    const bnbPrice = this.engine.getBnbPrice();
+    const isBnbToken = (sym: string) => sym === 'BNB' || sym === 'WBNB';
+    const isStable   = (sym: string) => sym === 'USDT' || sym === 'USDC';
+
+    let totalReserveUsd: number;
+    if (isStable(reserves.token1Symbol)) {
+      // e.g. BNB/USDT — reserve1 is USDT ≈ USD; reserve0 is BNB
+      totalReserveUsd = reserve1Num * 2;
+    } else if (isStable(reserves.token0Symbol)) {
+      // e.g. USDT/BNB — reverse order
+      totalReserveUsd = reserve0Num * 2;
+    } else if (isBnbToken(reserves.token0Symbol)) {
+      // e.g. BNB/CAKE — reserve0 is BNB → each BNB side = half total value
+      totalReserveUsd = reserve0Num * bnbPrice * 2;
+    } else if (isBnbToken(reserves.token1Symbol)) {
+      totalReserveUsd = reserve1Num * bnbPrice * 2;
+    } else {
+      // Unknown pair — sum raw amounts as fallback
+      totalReserveUsd = reserve0Num + reserve1Num;
+    }
 
     // Derive plausible 24h metrics from on-chain reserves.
     // These are estimates only — real volume/tx data would require a subgraph/API.

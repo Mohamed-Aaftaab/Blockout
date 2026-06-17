@@ -418,10 +418,18 @@ export class TradingEngine {
     const sizeWei  = ethers.parseUnits((order.size / this.bnbPriceUsd).toFixed(8), 18);
     const leverage = cfg.risk.leverageMultiplier;
     const slipBps  = Math.floor(order.slippage * 100);
+    // NOTE: This ABI signature is a documented stub matching common perp protocol conventions
+    // (GMX/Gains-style). Production use requires verifying the actual deployed ABI at
+    // cfg.venue.bscPerpsContract and updating this signature accordingly.
     const iface    = new ethers.Interface([
       'function openPosition(address market, bool isLong, uint256 size, uint256 leverage, uint256 slippage) external payable',
     ]);
     const calldata = iface.encodeFunctionData('openPosition', [cfg.venue.bscPerpsContract, isLong, sizeWei, leverage, slipBps]);
+    logger.warn('BSC Perpetuals order built — verify contract ABI matches deployed contract before live use', {
+      contract: cfg.venue.bscPerpsContract,
+      isLong,
+      size: sizeWei.toString(),
+    });
     return {
       hash:           '0x' + '0'.repeat(64),
       orderId:        order.id,
@@ -472,9 +480,10 @@ export class TradingEngine {
     const tokenA = tokens[baseSymbol  ?? 'WBNB'] ?? (tokens['WBNB'] ?? ethers.ZeroAddress);
     const tokenB = tokens[quoteSymbol ?? 'USDT'] ?? (tokens['USDT'] ?? ethers.ZeroAddress);
 
+    // Fallback uses correct decimal precision per token symbol
     const fallback: PoolReserves = {
-      reserve0: ethers.parseUnits('100000', 18),
-      reserve1: ethers.parseUnits('100000', 6),
+      reserve0: ethers.parseUnits('100000', getTokenDecimals(baseSymbol  ?? 'BNB')),
+      reserve1: ethers.parseUnits('100000', getTokenDecimals(quoteSymbol ?? 'USDT')),
       token0: tokenA, token1: tokenB,
       token0Symbol: baseSymbol ?? 'BNB', token1Symbol: quoteSymbol ?? 'USDT',
       pairAddress: ethers.ZeroAddress, fetchedAt: Date.now(),
@@ -520,13 +529,95 @@ export class TradingEngine {
     }
   }
 
+  /**
+   * Returns the USD value of the wallet's on-chain balance of a named token.
+   * Used by ExecutionService.getBaseTokenBalance() to cap sell sizes.
+   */
+  async getBaseTokenBalanceUsd(tokenSymbol: string, walletAddress: string): Promise<number> {
+    try {
+      const cfg     = this.config.get();
+      const network = cfg.network.mode === 'mainnet' ? 'mainnet' : 'testnet';
+      const tokens  = TOKEN_ADDRESSES[network] ?? TOKEN_ADDRESSES['testnet']!;
+      const wbnb    = tokens['WBNB'] ?? ethers.ZeroAddress;
+      const tokenAddr = tokens[tokenSymbol];
+      if (!tokenAddr) return 0;
+
+      const balWei = await this.getERC20Balance(tokenAddr, walletAddress);
+      if (balWei === 0n) return 0;
+
+      const dec      = getTokenDecimals(tokenSymbol);
+      const tokenAmt = Number(ethers.formatUnits(balWei, dec));
+
+      const v2Factory       = PANCAKE_V2_FACTORY[network] ?? PANCAKE_V2_FACTORY['testnet']!;
+      const tokenPriceInBnb = await this.getTokenPriceInBnb(tokenAddr, wbnb, this.requireProvider(), v2Factory);
+      return tokenAmt * tokenPriceInBnb * this.bnbPriceUsd;
+    } catch {
+      return 0;
+    }
+  }
+
+  // ─── ERC-20 balance helpers ─────────────────────────────────────────────────
+
+  private readonly ERC20_BALANCE_ABI = [
+    'function balanceOf(address owner) external view returns (uint256)',
+  ];
+
+  /**
+   * Returns the ERC-20 token balance of walletAddress in token-native units (wei).
+   * Returns 0n on any failure so callers can gracefully handle missing tokens.
+   */
+  async getERC20Balance(tokenAddress: string, walletAddress: string): Promise<bigint> {
+    try {
+      const provider = this.requireProvider();
+      const erc20    = new ethers.Contract(tokenAddress, this.ERC20_BALANCE_ABI, provider);
+      return await erc20.getFunction('balanceOf')(walletAddress) as bigint;
+    } catch {
+      return 0n;
+    }
+  }
+
+  /**
+   * Returns the full portfolio USD value including:
+   *  - Native BNB balance (always included)
+   *  - ERC-20 token balances for each configured trading pair's base token
+   *
+   * This prevents the circuit breaker from triggering prematurely after a buy
+   * converts BNB → token (which would otherwise make the BNB balance appear to shrink).
+   */
   async getPortfolioValue(walletAddress?: string): Promise<number> {
     try {
       const address = walletAddress ?? this.wallet?.address;
       if (!address) return 0;
+
+      const cfg     = this.config.get();
+      const network = cfg.network.mode === 'mainnet' ? 'mainnet' : 'testnet';
+      const tokens  = TOKEN_ADDRESSES[network] ?? TOKEN_ADDRESSES['testnet']!;
+      const wbnb    = tokens['WBNB'] ?? ethers.ZeroAddress;
+
+      // Native BNB balance
       const balanceWei = await this.requireProvider().getBalance(address);
-      const bnbBalance = Number(ethers.formatUnits(balanceWei, 18));
-      return bnbBalance * this.bnbPriceUsd;
+      let totalUsd     = Number(ethers.formatUnits(balanceWei, 18)) * this.bnbPriceUsd;
+
+      // ERC-20 token balances for each configured pair
+      for (const pair of cfg.tradingPairs) {
+        const [baseSymbol] = pair.split('/');
+        const tokenAddr    = tokens[baseSymbol ?? ''];
+        if (!tokenAddr || tokenAddr.toLowerCase() === wbnb.toLowerCase()) continue;
+
+        const tokenBalWei = await this.getERC20Balance(tokenAddr, address);
+        if (tokenBalWei === 0n) continue;
+
+        // Convert token balance → USD via pool price
+        const tokenPriceInBnb = await this.getTokenPriceInBnb(tokenAddr, wbnb, this.requireProvider(),
+          PANCAKE_V2_FACTORY[network] ?? PANCAKE_V2_FACTORY['testnet']!);
+        if (tokenPriceInBnb > 0) {
+          const dec      = getTokenDecimals(baseSymbol ?? '');
+          const tokenAmt = Number(ethers.formatUnits(tokenBalWei, dec));
+          totalUsd      += tokenAmt * tokenPriceInBnb * this.bnbPriceUsd;
+        }
+      }
+
+      return totalUsd;
     } catch {
       return 0;
     }

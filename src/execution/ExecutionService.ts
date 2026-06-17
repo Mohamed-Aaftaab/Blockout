@@ -235,7 +235,23 @@ export class ExecutionService {
     return this.engine.getPortfolioValue(this.wallet.address);
   }
 
-  // Sends a raw transaction (approve or swap) and returns the tx hash
+  /**
+   * Returns the wallet's actual on-chain balance (in USD) of the base token of a pair.
+   * Used before issuing a sell to prevent reverts when a prior buy partially filled.
+   * Returns null if the token is native BNB (no ERC-20 balance to check).
+   */
+  async getBaseTokenBalance(pair: string): Promise<number | null> {
+    if (!this.wallet) return null;
+    const [baseSymbol] = pair.split('/');
+    if (!baseSymbol) return null;
+    // Native BNB pairs don't need an ERC-20 balance check
+    if (baseSymbol === 'BNB' || baseSymbol === 'WBNB') return null;
+    const balanceUsd = await this.engine.getBaseTokenBalanceUsd(baseSymbol, this.wallet.address);
+    return balanceUsd;
+  }
+
+  // Sends a raw transaction (approve or swap) and returns the tx hash.
+  // Uses explicit pending nonce to prevent collisions when two pairs execute concurrently.
   private async sendRawTx(
     to:       string,
     calldata: string,
@@ -248,7 +264,11 @@ export class ExecutionService {
     if (!provider) throw new Error('Provider not initialized');
     const signer      = this.wallet.connect(provider);
     const gasPriceWei = ethers.parseUnits(gasPrice.toFixed(9), 'gwei');
-    const sentTx = await signer.sendTransaction({ to, data: calldata, value, gasPrice: gasPriceWei, gasLimit });
+    // Explicitly fetch the pending nonce so concurrent transactions from different
+    // pairs don't collide. ethers auto-manages nonces within a single instance but
+    // explicit pending nonce is more robust under high-frequency scenarios.
+    const nonce  = await signer.getNonce('pending');
+    const sentTx = await signer.sendTransaction({ to, data: calldata, value, gasPrice: gasPriceWei, gasLimit, nonce });
     return sentTx.hash;
   }
 

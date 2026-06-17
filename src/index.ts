@@ -334,7 +334,7 @@ async function bootstrap(): Promise<void> {
       logger.info('Position opened', {
         id:        position.id,
         pair:      signal.pair,
-        side:      signal.side,
+        side:      order.side,
         entry:     entryPrice,
         sl:        stopLoss.toFixed(4),
         tp:        takeProfit.toFixed(4),
@@ -343,6 +343,9 @@ async function bootstrap(): Promise<void> {
 
       if (latencyMs > cfg.latencyWarningMs) {
         bus.emit('health:latency', { latencyMs, threshold: cfg.latencyWarningMs });
+      }
+      if (latencyMs > cfg.latencyTargetMs) {
+        logger.warn('Execution latency exceeded target', { latencyMs, latencyTargetMs: cfg.latencyTargetMs });
       }
 
     } catch (e) {
@@ -365,13 +368,43 @@ async function bootstrap(): Promise<void> {
     openPositionMap.delete(positionId);
     riskMgr.onPositionClosed(positionId);
 
+    // ── Issue S: cap close size to actual token balance to prevent on-chain reverts ──
+    // When a buy swap partially filled, fewer tokens landed in the wallet than expected.
+    // Reading the actual ERC-20 balance prevents the close order from reverting.
+    let closeSize = position.size;
+    if (position.side === 'buy') {
+      const actualTokenBalance = await executionSvc.getBaseTokenBalance(position.pair);
+      if (actualTokenBalance !== null && actualTokenBalance < position.size) {
+        logger.warn('Close size capped to actual on-chain token balance', {
+          positionId, expected: position.size, actual: actualTokenBalance,
+        });
+        closeSize = actualTokenBalance;
+      }
+    }
+
+    // If token balance is effectively zero (already moved or lost), record a zero-pnl trade
+    if (closeSize <= 0) {
+      logger.warn('Close size is zero — skipping close order (tokens no longer in wallet)', { positionId });
+      const tradeRecord: TradeRecord = {
+        id: uuid(), position, closePrice: exitPrice, closedAt: Date.now(),
+        exitReason: reason, pnlUsd: 0, pnlPct: 0,
+        holdMs: Date.now() - openedAt, transactions: [], signalToTxMs: 0,
+      };
+      analytics.recordTrade(tradeRecord);
+      await stateMutex.run(async () => {
+        currentState = { ...currentState, openPositions: currentState.openPositions.filter(p => p.id !== positionId) };
+        await stateMgr.saveState(currentState);
+      });
+      return;
+    }
+
     // Execute closing order (reverse of open)
     const closeOrder: Order = {
       id:        uuid(),
       pair:      position.pair,
       type:      'market',
       side:      position.side === 'buy' ? 'sell' : 'buy',
-      size:      position.size,
+      size:      closeSize,
       venue:     position.venue,
       slippage:  cfg.slippage.defaultPct,
       twap:      null,
@@ -380,7 +413,24 @@ async function bootstrap(): Promise<void> {
     };
 
     const execResult = await executionSvc.executeOrder(closeOrder);
-    const closeTxs   = execResult.ok ? [execResult.value] : [];
+
+    // ── Issue K: if close execution fails, restore position to prevent state corruption ──
+    // Without this, the position disappears from internal maps but stays open on-chain,
+    // causing a mismatch between internal state and actual wallet holdings.
+    if (!execResult.ok) {
+      logger.error('Close order failed — restoring position to maps so SL/TP can retry', {
+        positionId, pair: position.pair, reason, error: execResult.error.message,
+      });
+      openPositionMap.set(positionId, { position, signal, openedAt });
+      riskMgr.onPositionOpened(position);
+      bus.emit('health:warning', {
+        component: 'handlePositionClose',
+        message:   `Close order failed for ${positionId}: ${execResult.error.message}`,
+      });
+      return;
+    }
+
+    const closeTxs = [execResult.value];
 
     // PnL calculation — correct for both long (buy) and short (sell)
     const pnlUsd = position.side === 'buy'

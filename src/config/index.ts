@@ -43,8 +43,8 @@ export class ConfigurationService {
     // (empty string / 0 / []) so validation errors are descriptive.
     const raw = {
       cmcApiKey:          process.env['CMC_API_KEY'] ?? '',
-      twakAccessId:       process.env['TWAK_ACCESS_ID'] ?? '',
-      twakHmacSecret:     process.env['TWAK_HMAC_SECRET'] ?? '',
+      twakAccessId:       process.env['TWAK_ACCESS_ID'],
+      twakHmacSecret:     process.env['TWAK_HMAC_SECRET'],
       tradingPairs:       (process.env['TRADING_PAIRS'] ?? '')
         .split(',')
         .map((s) => s.trim())

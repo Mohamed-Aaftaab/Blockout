@@ -348,6 +348,12 @@ export class MarketDataService {
         ma50: toNumber(ma?.['ma_50']),
       };
     } catch {
+      logger.warn(
+        'CMC technical indicators unavailable — using neutral defaults. ' +
+        'Note: /v3/cryptocurrency/technical-indicator/latest requires CMC Agent Hub tier. ' +
+        'Signals will rely on price momentum and OHLCV candles.',
+        { pair, id },
+      );
       return buildDefaultIndicators();
     }
   }

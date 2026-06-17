@@ -130,8 +130,15 @@ export class RiskManager {
   }
 
   async checkDrawdown(): Promise<void> {
-    if (this.drawdownBaseline === 0) return;
     const current = await this.engine.getPortfolioValue();
+    // If baseline is 0 (empty wallet at startup) and funds have now arrived, set baseline
+    if (this.drawdownBaseline === 0) {
+      if (current > 0) {
+        this.drawdownBaseline = current;
+        logger.info('Drawdown baseline set (first non-zero portfolio detected)', { baseline: current });
+      }
+      return;
+    }
     const drawdownPct = (this.drawdownBaseline - current) / this.drawdownBaseline * 100;
     const cfg = this.config.get().risk;
 

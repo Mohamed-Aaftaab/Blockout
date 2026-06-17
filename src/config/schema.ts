@@ -103,10 +103,10 @@ const AdaptiveConfigSchema = z.object({
 export const ConfigSchema = z.object({
   // CMC_API_KEY
   cmcApiKey:         z.string().min(32),
-  // TWAK_ACCESS_ID
-  twakAccessId:      z.string().min(8),
-  // TWAK_HMAC_SECRET
-  twakHmacSecret:    z.string().min(16),
+  // TWAK_ACCESS_ID — optional, reserved for Trust Wallet Agent Kit when SDK is published
+  twakAccessId:      z.string().min(8).optional().default(''),
+  // TWAK_HMAC_SECRET — optional, reserved for Trust Wallet Agent Kit when SDK is published
+  twakHmacSecret:    z.string().min(16).optional().default(''),
   // TRADING_PAIRS (comma-separated)
   tradingPairs:      z.array(z.string().regex(/^[A-Z]+\/[A-Z]+$/)).min(1),
 
@@ -140,7 +140,7 @@ export const ConfigSchema = z.object({
   // LATENCY_TARGET_MS
   latencyTargetMs:    z.number().int().min(100).max(10000).default(3000),
   // STATE_PERSIST_SEC
-  statePersistSec:    z.number().int().min(1).max(60).default(5),
+  statePersistSec:    z.number().int().min(1).max(300).default(30),
   // STATE_FILE_PATH
   stateFilePath:      z.string().default('./data/state.json'),
   // ANALYTICS_FILE_PATH
