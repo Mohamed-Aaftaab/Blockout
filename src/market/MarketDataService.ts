@@ -96,6 +96,24 @@ export class MarketDataService {
       logger.warn('CMC API verification failed — will retry on first poll', { error: String(e) });
     }
 
+    // If BNB/USDT is not in the configured pairs, set up a background poller
+    // to keep bnbPriceUsd accurate for portfolio valuation and USD→BNB conversions.
+    const hasBnbUsdtPair = cfg.tradingPairs.some(p => p === 'BNB/USDT');
+    if (!hasBnbUsdtPair && this.tradingEngine !== null) {
+      // Fetch BNB price immediately and then every dataRefreshSec
+      void this.fetchQuote('BNB/USDT').then(q => {
+        if (q.price > 0 && this.tradingEngine !== null) this.tradingEngine.setBnbPrice(q.price);
+      }).catch(() => undefined);
+
+      const bnbHandle = setInterval(() => {
+        void this.fetchQuote('BNB/USDT').then(q => {
+          if (q.price > 0 && this.tradingEngine !== null) this.tradingEngine.setBnbPrice(q.price);
+        }).catch(() => undefined);
+      }, cfg.dataRefreshSec * 1000);
+      this.intervals.push(bnbHandle);
+      logger.info('BNB/USDT price poller started (not in trading pairs)');
+    }
+
     // Set up per-pair polling
     for (const pair of cfg.tradingPairs) {
       // Initial fetch

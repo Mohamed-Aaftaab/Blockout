@@ -29,6 +29,22 @@ const logger = createLogger({
   transports: [new transports.Console()],
 });
 
+/**
+ * Lightweight async mutex — ensures sequential state saves.
+ * Prevents race conditions when open and close operations overlap.
+ */
+class StateMutex {
+  private queue: Promise<void> = Promise.resolve();
+
+  /** Run `fn` exclusively — waits for any pending save to complete first */
+  run<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(fn);
+    // Absorb rejections on the chain so later operations still run
+    this.queue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+}
+
 async function bootstrap(): Promise<void> {
 
   // ── [1] Configuration ─────────────────────────────────────────────────────
@@ -48,6 +64,9 @@ async function bootstrap(): Promise<void> {
   const stateResult = await stateMgr.loadState();
   // Use a mutable reference so state updates are reflected everywhere
   let currentState: SystemState = stateResult.ok ? stateResult.value : stateMgr.emptyState();
+
+  // Mutex serialises all currentState mutations to prevent concurrent write corruption
+  const stateMutex = new StateMutex();
 
   // ── [4] Parallel SDK init ─────────────────────────────────────────────────
   const tradingEngine = new TradingEngine(configSvc, bus);
@@ -281,12 +300,14 @@ async function bootstrap(): Promise<void> {
       riskMgr.onPositionOpened(position);
       openPositionMap.set(position.id, { position, signal, openedAt: signalTimestamp });
 
-      // Update the live state snapshot (not the stale startup snapshot)
-      currentState = {
-        ...currentState,
-        openPositions: [...currentState.openPositions, position],
-      };
-      await stateMgr.saveState(currentState);
+      // Serialised state update — prevents race with concurrent handlePositionClose
+      await stateMutex.run(async () => {
+        currentState = {
+          ...currentState,
+          openPositions: [...currentState.openPositions, position],
+        };
+        await stateMgr.saveState(currentState);
+      });
 
       const latencyMs = (firstTx?.submittedAt ?? Date.now()) - signalTimestamp;
       logger.info('Position opened', {
@@ -373,12 +394,14 @@ async function bootstrap(): Promise<void> {
       pnlPct: pnlPct.toFixed(2),
     });
 
-    // Update live state (remove closed position)
-    currentState = {
-      ...currentState,
-      openPositions: currentState.openPositions.filter(p => p.id !== positionId),
-    };
-    await stateMgr.saveState(currentState);
+    // Serialised state update — prevents race with concurrent executeSignalPipeline
+    await stateMutex.run(async () => {
+      currentState = {
+        ...currentState,
+        openPositions: currentState.openPositions.filter(p => p.id !== positionId),
+      };
+      await stateMgr.saveState(currentState);
+    });
   }
 
   // ── [9] Banner ────────────────────────────────────────────────────────────
@@ -413,12 +436,14 @@ async function bootstrap(): Promise<void> {
 
     logger.info(analytics.generateReport('shutdown'));
 
-    // Persist the current live state (not the stale startup snapshot)
-    await stateMgr.saveState({
-      ...currentState,
-      openPositions:       currentState.openPositions,
-      pendingTransactions: [],
-      emergencyShutdown:   reason === 'emergency' || reason === 'file-trigger',
+    // Final state save via mutex to avoid racing with any in-flight operations
+    await stateMutex.run(async () => {
+      await stateMgr.saveState({
+        ...currentState,
+        openPositions:       currentState.openPositions,
+        pendingTransactions: [],
+        emergencyShutdown:   reason === 'emergency' || reason === 'file-trigger',
+      });
     });
 
     logger.info('Blockout shutdown complete');
