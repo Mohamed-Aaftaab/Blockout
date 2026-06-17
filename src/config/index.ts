@@ -146,6 +146,7 @@ export class ConfigurationService {
       stateFilePath:      process.env['STATE_FILE_PATH'],
       analyticsFilePath:  process.env['ANALYTICS_FILE_PATH'],
       shutdownSignalFile: process.env['SHUTDOWN_SIGNAL_FILE'],
+      resetCircuitBreakerFile: process.env['RESET_CIRCUIT_BREAKER_FILE'],
       logLevel:           process.env['LOG_LEVEL'],
       tradingHoursStart:  process.env['TRADING_HOURS_START'],
       tradingHoursEnd:    process.env['TRADING_HOURS_END'],

@@ -21,6 +21,11 @@ export class HealthMonitor {
   }
 
   start(): void {
+    // Guard against double-start (e.g. bootstrap retry)
+    if (this.startTime > 0) {
+      logger.warn('HealthMonitor.start() called while already running — ignoring');
+      return;
+    }
     this.startTime = Date.now();
     const cfg = this.config.get();
 
@@ -79,6 +84,15 @@ export class HealthMonitor {
     if (fs.existsSync(cfg.shutdownSignalFile)) {
       logger.warn('Shutdown signal file detected', { file: cfg.shutdownSignalFile });
       void this.triggerEmergencyShutdown('file-trigger');
+    }
+    // Check for circuit breaker reset signal
+    if (fs.existsSync(cfg.resetCircuitBreakerFile)) {
+      logger.info('Circuit breaker reset file detected — resetting circuit breaker', {
+        file: cfg.resetCircuitBreakerFile,
+      });
+      // Remove the reset file first so we don't re-trigger next poll
+      try { fs.unlinkSync(cfg.resetCircuitBreakerFile); } catch { /* ignore */ }
+      this.bus.emit('health:circuit_breaker_reset', { timestamp: Date.now() });
     }
   }
 

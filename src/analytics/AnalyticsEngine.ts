@@ -137,6 +137,8 @@ export class AnalyticsEngine {
       if (!byPair[p]) byPair[p] = { pair: p, totalTrades: 0, winRate: 0, pnlUsd: 0 };
       byPair[p]!.totalTrades++;
       byPair[p]!.pnlUsd += t.pnlUsd;
+      // Track wins inline to avoid a second O(n) pass per pair later
+      if (t.pnlUsd > 0) byPair[p]!.winRate += 1; // temporarily store win count
 
       const v = t.position.venue;
       if (!byVenue[v]) byVenue[v] = { venue: v as Venue, totalTrades: 0, avgSlippagePct: 0, pnlUsd: 0 };
@@ -149,10 +151,9 @@ export class AnalyticsEngine {
       byStrategy[s]!.pnlUsd += t.pnlUsd;
     }
 
-    // Compute per-pair win rates
-    for (const [pair, m] of Object.entries(byPair)) {
-      const pairWins = trades.filter(t => t.position.pair === pair && t.pnlUsd > 0).length;
-      m.winRate = m.totalTrades > 0 ? pairWins / m.totalTrades : 0;
+    // Convert per-pair win counts (stored temporarily in winRate field) to actual win rates
+    for (const m of Object.values(byPair)) {
+      m.winRate = m.totalTrades > 0 ? m.winRate / m.totalTrades : 0;
     }
 
     return {

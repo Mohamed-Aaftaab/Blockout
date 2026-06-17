@@ -227,6 +227,20 @@ async function bootstrap(): Promise<void> {
     void handlePositionClose(positionId, price, 'take_profit');
   });
 
+  // ── [8e] Manual circuit breaker reset via file signal ─────────────────────
+  bus.on('health:circuit_breaker_reset', () => {
+    logger.info('Circuit breaker reset via file signal');
+    riskMgr.resetCircuitBreaker();
+    // Persist the reset state immediately
+    void stateMutex.run(async () => {
+      await stateMgr.saveState({
+        ...currentState,
+        drawdownBaseline:     riskMgr.getDrawdownBaseline(),
+        circuitBreakerActive: false,
+      });
+    });
+  });
+
   // ─────────────────────────────────────────────────────────────────────────
   // Full order execution pipeline
   // ─────────────────────────────────────────────────────────────────────────
@@ -412,9 +426,14 @@ async function bootstrap(): Promise<void> {
     // If token balance is effectively zero (already moved or lost), record a zero-pnl trade
     if (closeSize <= 0) {
       logger.warn('Close size is zero — skipping close order (tokens no longer in wallet)', { positionId });
+      // Still record the real price movement % so metrics reflect the actual market outcome
+      const zeroPnlUsd = 0; // no tokens to sell = $0 recovered
+      const realPnlPct = position.side === 'buy'
+        ? (exitPrice - position.entryPrice) / position.entryPrice * 100
+        : (position.entryPrice - exitPrice) / position.entryPrice * 100;
       const tradeRecord: TradeRecord = {
         id: uuid(), position, closePrice: exitPrice, closedAt: Date.now(),
-        exitReason: reason, pnlUsd: 0, pnlPct: 0,
+        exitReason: reason, pnlUsd: zeroPnlUsd, pnlPct: realPnlPct,
         holdMs: Date.now() - openedAt, transactions: [], signalToTxMs: 0,
       };
       analytics.recordTrade(tradeRecord);

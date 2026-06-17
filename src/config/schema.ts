@@ -39,9 +39,9 @@ const GasConfigSchema = z.object({
 });
 
 const SlippageConfigSchema = z.object({
-  defaultPct: z.number().min(0.1).max(5).default(0.5),
-  maxPct:     z.number().min(0.5).max(10).default(3.0),
-  bumpPct:    z.number().min(0.1).max(2.0).default(0.3),
+  defaultPct: z.number().min(0.1).max(5).default(1.5),   // 1.5% default — BSC V2 pools commonly need ≥1%
+  maxPct:     z.number().min(0.5).max(10).default(5.0),  // raised to 5% max for volatile tokens
+  bumpPct:    z.number().min(0.1).max(2.0).default(0.5), // 0.5% bump per retry
   maxRetries: z.number().int().min(1).max(10).default(3),
 });
 
@@ -71,7 +71,7 @@ const SignalConfigSchema = z.object({
 });
 
 const ScalpingConfigSchema = z.object({
-  athDropPct:      z.number().min(10).max(80).default(35),
+  athDropPct:      z.number().min(1).max(80).default(10),  // 10% dip from ATH — fires in normal market swings
   positionSizeUsd: z.number().min(1).default(100),
   takeProfitPct:   z.number().min(0.1).max(100).default(15),
   stopLossPct:     z.number().min(0.1).max(50).default(5),
@@ -148,6 +148,8 @@ export const ConfigSchema = z.object({
   analyticsFilePath:  z.string().default('./data/analytics.json'),
   // SHUTDOWN_SIGNAL_FILE
   shutdownSignalFile: z.string().default('./SHUTDOWN'),
+  // RESET_CIRCUIT_BREAKER_FILE — touch this file to reset the circuit breaker without restarting
+  resetCircuitBreakerFile: z.string().default('./RESET_CIRCUIT_BREAKER'),
   // LOG_LEVEL
   logLevel:           z.enum(['debug', 'info', 'warn', 'error', 'critical']).default('info'),
   // TRADING_HOURS_START

@@ -72,11 +72,12 @@ export interface AgentEvents {
   'analytics:metrics_updated': [PerformanceMetrics];
 
   // Health
-  'health:critical':  [{ component: string; message: string; timestamp: number }];
-  'health:warning':   [{ component: string; message: string }];
-  'health:recovery':  [{ component: string; timestamp: number }];
-  'health:shutdown':  [{ reason: string; timestamp: number }];
-  'health:latency':   [{ latencyMs: number; threshold: number }];
+  'health:critical':                [{ component: string; message: string; timestamp: number }];
+  'health:warning':                 [{ component: string; message: string }];
+  'health:recovery':                [{ component: string; timestamp: number }];
+  'health:shutdown':                [{ reason: string; timestamp: number }];
+  'health:latency':                 [{ latencyMs: number; threshold: number }];
+  'health:circuit_breaker_reset':   [{ timestamp: number }];
 
   // Unused imports kept for completeness — Order is referenced elsewhere
   'engine:order_created': [{ order: Order }];
