@@ -74,19 +74,20 @@ export class StrategyManager {
       if (candidates.length === 0) return;
 
       const resolved = candidates.length === 1
-        ? candidates[0]!.order
+        ? candidates[0]!
         : this.resolveConflict(candidates);
 
-      this.bus.emit('strategy:signal', { signal, strategy: resolved.id });
+      // Emit the WINNING candidate's signal (correct side) and its order ID
+      this.bus.emit('strategy:signal', { signal: resolved.signal, strategy: resolved.strategy.name, order: resolved.order });
 
       logger.info('Strategy order produced', {
-        pair:      signal.pair,
+        pair:      resolved.signal.pair,
         regime:    currentRegime,
-        orderId:   resolved.id,
-        side:      resolved.side,
-        size:      resolved.size,
-        type:      resolved.type,
-        confidence: signal.confidence.toFixed(3),
+        orderId:   resolved.order.id,
+        side:      resolved.order.side,
+        size:      resolved.order.size,
+        type:      resolved.order.type,
+        confidence: resolved.signal.confidence.toFixed(3),
       });
     };
 
@@ -135,7 +136,7 @@ export class StrategyManager {
     logger.info('Strategy weights adjusted', { weights });
   }
 
-  private resolveConflict(candidates: StrategyOrderPair[]): Order {
+  private resolveConflict(candidates: StrategyOrderPair[]): StrategyOrderPair {
     // Pick the order from the strategy whose signal has the highest confidence
     // Tiebreak: higher strategy weight wins
     let best = candidates[0]!;
@@ -161,6 +162,6 @@ export class StrategyManager {
       })),
     });
 
-    return best.order;
+    return best;
   }
 }

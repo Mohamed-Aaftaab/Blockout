@@ -170,14 +170,37 @@ async function bootstrap(): Promise<void> {
   });
 
   // ── [8c] strategy:signal → execution pipeline ────────────────────────────
-  bus.on('strategy:signal', ({ signal }) => {
+  /**
+   * Returns true if the current UTC time is within the configured trading window.
+   * Both start and end are HH:MM strings. Handles midnight-spanning windows
+   * (e.g. "22:00" to "02:00") correctly.
+   */
+  function isWithinTradingHours(): boolean {
+    const { tradingHoursStart, tradingHoursEnd } = cfg;
+    if (tradingHoursStart === '00:00' && tradingHoursEnd === '23:59') return true; // default = always
+    const now  = new Date();
+    const hhmm = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}`;
+    if (tradingHoursStart <= tradingHoursEnd) {
+      return hhmm >= tradingHoursStart && hhmm <= tradingHoursEnd;
+    }
+    // Midnight-spanning window
+    return hhmm >= tradingHoursStart || hhmm <= tradingHoursEnd;
+  }
+
+  bus.on('strategy:signal', ({ signal, order: strategyOrder }) => {
+    // Enforce trading hours window
+    if (!isWithinTradingHours()) {
+      logger.debug('Signal skipped: outside trading hours', { pair: signal.pair, tradingHoursStart: cfg.tradingHoursStart, tradingHoursEnd: cfg.tradingHoursEnd });
+      return;
+    }
     // Skip if already processing this pair — prevents duplicate positions
     if (pipelineInProgress.has(signal.pair)) {
       logger.debug('Pipeline already in progress for pair, skipping duplicate signal', { pair: signal.pair });
       return;
     }
     pipelineInProgress.add(signal.pair);
-    void executeSignalPipeline(signal).finally(() => {
+    // Pass the resolved order from the strategy so side/size/type are correct
+    void executeSignalPipeline(signal, strategyOrder).finally(() => {
       pipelineInProgress.delete(signal.pair);
     });
   });
@@ -193,7 +216,7 @@ async function bootstrap(): Promise<void> {
   // ─────────────────────────────────────────────────────────────────────────
   // Full order execution pipeline
   // ─────────────────────────────────────────────────────────────────────────
-  async function executeSignalPipeline(signal: TradingSignal): Promise<void> {
+  async function executeSignalPipeline(signal: TradingSignal, strategyOrder: Order): Promise<void> {
     const signalTimestamp = Date.now();
     try {
       // 1. Pool health check
@@ -211,15 +234,13 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
+      // Use the strategy's resolved order for side/type/venue — critical for correctness.
+      // Override size with the risk-manager-calculated size so we don't exceed portfolio limits.
       const order: Order = {
+        ...strategyOrder,
         id:        uuid(),
-        pair:      signal.pair,
-        type:      'market',
-        side:      signal.side,
         size:      posResult.value,
-        venue:     'pancakeswap',
         slippage:  cfg.slippage.defaultPct,
-        twap:      null,
         createdAt: Date.now(),
         signalId:  signal.id,
       };
@@ -275,17 +296,17 @@ async function bootstrap(): Promise<void> {
       // SL/TP directions are correct for both buy and sell:
       // Buy:  SL below entry, TP above entry
       // Sell: SL above entry, TP below entry
-      const stopLoss   = signal.side === 'buy'
+      const stopLoss   = order.side === 'buy'
         ? entryPrice * (1 - cfg.risk.stopLossPct  / 100)
         : entryPrice * (1 + cfg.risk.stopLossPct  / 100);
-      const takeProfit = signal.side === 'buy'
+      const takeProfit = order.side === 'buy'
         ? entryPrice * (1 + cfg.risk.takeProfitPct / 100)
         : entryPrice * (1 - cfg.risk.takeProfitPct / 100);
 
       const position: Position = {
         id:         validOrder.id,
         pair:       signal.pair,
-        side:       signal.side,
+        side:       order.side,
         entryPrice,
         size:       validOrder.size,
         stopLoss,
@@ -418,6 +439,16 @@ async function bootstrap(): Promise<void> {
     wallet:     executionSvc.getWalletAddress(),
   });
 
+  // ── Periodic state persistence ────────────────────────────────────────────
+  // Saves the current state every statePersistSec seconds regardless of trade activity.
+  // This ensures the drawdown baseline and circuit breaker state are persisted
+  // even during quiet periods when no positions open or close.
+  const statePersistInterval = setInterval(() => {
+    void stateMutex.run(async () => {
+      await stateMgr.saveState(currentState);
+    });
+  }, cfg.statePersistSec * 1000);
+
   // ── Graceful shutdown ─────────────────────────────────────────────────────
   let shutdownInProgress = false;
 
@@ -426,6 +457,7 @@ async function bootstrap(): Promise<void> {
     shutdownInProgress = true;
     logger.info('Shutting down Blockout...', { reason });
 
+    clearInterval(statePersistInterval);
     stratMgr.stop();
     riskMgr.stop();
     analytics.stop();

@@ -5,6 +5,16 @@ import type { EventBus }             from '../events/EventBus';
 import type { PoolHealth }           from '../types/index';
 import type { TradingEngine }        from '../execution/TradingEngine';
 
+// Token decimals — mirrors TradingEngine's TOKEN_DECIMALS
+const TOKEN_DECIMALS: Record<string, number> = {
+  USDT: 6,
+  USDC: 6,
+};
+
+function getTokenDecimals(symbol: string): number {
+  return TOKEN_DECIMALS[symbol] ?? 18;
+}
+
 const logger = createLogger({
   level: 'info',
   format: format.combine(format.timestamp(), format.json()),
@@ -24,14 +34,24 @@ export class PoolAnalyzer {
 
   async analyzePool(pair: string): Promise<PoolHealth> {
     const reserves = await this.engine.getPoolReserves(pair);
-    const reserve0Num = Number(ethers.formatUnits(reserves.reserve0, 18));
-    const reserve1Num = Number(ethers.formatUnits(reserves.reserve1, 6));
+
+    // Use the correct decimals for each token in the pair
+    const token0Dec = getTokenDecimals(reserves.token0Symbol);
+    const token1Dec = getTokenDecimals(reserves.token1Symbol);
+
+    const reserve0Num = Number(ethers.formatUnits(reserves.reserve0, token0Dec));
+    const reserve1Num = Number(ethers.formatUnits(reserves.reserve1, token1Dec));
     const totalReserveUsd = reserve0Num + reserve1Num;
 
-    // For demo/testnet: derive plausible 24h volume and tx count from reserves
-    const volume24h    = totalReserveUsd * 0.05;  // ~5% turnover
-    const txCount24h   = Math.floor(totalReserveUsd / 1000);
-    const reserveDrainPct = 0;  // No history available yet — 0 means healthy
+    // Derive plausible 24h metrics from on-chain reserves.
+    // These are estimates only — real volume/tx data would require a subgraph/API.
+    // The 5% turnover and per-$1000 tx estimates are conservative baselines.
+    const volume24h    = totalReserveUsd * 0.05;         // ~5% daily turnover
+    const txCount24h   = Math.max(                        // at least 1 tx per $500 reserve
+      Math.floor(totalReserveUsd / 500),
+      totalReserveUsd >= 1000 ? 1 : 0,
+    );
+    const reserveDrainPct = 0;
 
     const health: PoolHealth = {
       pair,

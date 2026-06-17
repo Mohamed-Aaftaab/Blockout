@@ -45,7 +45,9 @@ const TransactionSchema: z.ZodType<Transaction> = z.object({
   blockNumber:    z.number().nullable(),
   error:          z.string().nullable(),
   calldata:       z.string(),
-  value:          z.bigint(),
+  // value is serialised as a decimal string by saveState (JSON cannot hold bigint)
+  // Accept both bigint (in-memory) and string (from JSON) and coerce to bigint
+  value:          z.union([z.bigint(), z.string()]).transform(v => BigInt(v)),
   to:             z.string(),
 }) as z.ZodType<Transaction>;
 
@@ -90,7 +92,11 @@ export class StateManager {
       checksum,
     };
 
-    const content = JSON.stringify(stateToSave, null, 2);
+    // JSON.stringify cannot handle bigint natively (Transaction.value is bigint).
+    // Serialise bigint as a decimal string; reviver in loadState restores it.
+    const content = JSON.stringify(stateToSave, (_key, value) =>
+      typeof value === 'bigint' ? value.toString() : value
+    , 2);
 
     // Ensure directory exists
     const dir = path.dirname(cfg.stateFilePath);
@@ -122,7 +128,14 @@ export class StateManager {
 
     try {
       const raw  = await fs.promises.readFile(filePath, 'utf8');
-      const json = JSON.parse(raw) as unknown;
+      // Revive bigint values that were serialised as decimal strings by saveState.
+      // Only the Transaction.value field is bigint — it always parses to a valid BigInt.
+      const json = JSON.parse(raw, (key, value) => {
+        if (key === 'value' && typeof value === 'string') {
+          try { return BigInt(value); } catch { return value; }
+        }
+        return value;
+      }) as unknown;
 
       // Zod validation
       const parsed = SystemStateSchema.safeParse(json);
@@ -161,9 +174,19 @@ export class StateManager {
   }
 
   private computeChecksum(state: Omit<SystemState, 'checksum'>): string {
-    // Sort keys deterministically for consistent hashing
-    const sorted = JSON.stringify(state, Object.keys(state).sort() as string[]);
-    return 'sha256:' + crypto.createHash('sha256').update(sorted).digest('hex');
+    // Deep-sort all object keys so the hash is deterministic regardless of
+    // insertion order or Node.js version. Convert bigint to string so
+    // JSON.stringify doesn't throw on Transaction.value fields.
+    const stableStringify = (val: unknown): string => {
+      if (typeof val === 'bigint') return `"${val.toString()}"`;
+      if (val === null || typeof val !== 'object') return JSON.stringify(val);
+      if (Array.isArray(val)) return '[' + val.map(stableStringify).join(',') + ']';
+      const sorted = Object.keys(val as object).sort().map(k => {
+        return JSON.stringify(k) + ':' + stableStringify((val as Record<string, unknown>)[k]);
+      });
+      return '{' + sorted.join(',') + '}';
+    };
+    return 'sha256:' + crypto.createHash('sha256').update(stableStringify(state)).digest('hex');
   }
 
   private verifyChecksum(state: SystemState): boolean {

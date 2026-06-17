@@ -32,7 +32,7 @@ export interface AgentEvents {
   'regime:changed':      [{ pair: string; from: MarketRegime; to: MarketRegime; timestamp: number }];
 
   // Strategy
-  'strategy:signal':      [{ signal: TradingSignal; strategy: string }];
+  'strategy:signal':      [{ signal: TradingSignal; strategy: string; order: Order }];
   'strategy:deactivated': [{ strategy: string; reason: string }];
   'strategy:weights':     [{ weights: Record<string, number>; reason: string }];
 

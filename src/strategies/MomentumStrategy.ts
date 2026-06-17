@@ -20,7 +20,7 @@ export class MomentumStrategy implements IStrategy {
     const cfg = this.config.get();
     return {
       id: uuid(), pair: signal.pair, type: 'market',
-      side: signal.side, size: cfg.risk.maxPositionPct * 10,
+      side: signal.side, size: cfg.scalping.positionSizeUsd,
       venue: 'pancakeswap', slippage: cfg.slippage.defaultPct,
       twap: null, createdAt: Date.now(), signalId: signal.id,
     };

@@ -56,6 +56,9 @@ function makeTx(overrides: Partial<Transaction> = {}): Transaction {
     confirmedAt:    Date.now(),
     blockNumber:    12345,
     error:          null,
+    calldata:       '0x',
+    value:          0n,
+    to:             '0x0000000000000000000000000000000000000000',
     ...overrides,
   };
 }
