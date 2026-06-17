@@ -52,6 +52,12 @@ const TOKEN_ADDRESSES: Record<string, Record<string, string>> = {
   },
 };
 
+// PancakeSwap V2 Factory addresses (used for pool reserve lookups — must match V2 router)
+const PANCAKE_V2_FACTORY: Record<string, string> = {
+  mainnet: '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73',
+  testnet: '0x6725F303b657a9451d8BA641348b6761A6CC7a17',
+};
+
 // Token decimals — USDT/USDC use 6, everything else 18
 const TOKEN_DECIMALS: Record<string, number> = {
   USDT: 6,
@@ -151,23 +157,29 @@ export class TradingEngine {
 
   async routeOrder(order: Order): Promise<Result<Transaction, EngineError>> {
     try {
-      const plan = await this.buildSwapPlan(order);
-      const tx: Transaction = {
-        hash:           '0x' + '0'.repeat(64),
-        orderId:        order.id,
-        status:         'pending',
-        gasPrice:       0,
-        gasLimit:       plan.swapTx.gasLimit,
-        gasUsed:        null,
-        actualSlippage: null,
-        submittedAt:    Date.now(),
-        confirmedAt:    null,
-        blockNumber:    null,
-        error:          null,
-        calldata:       plan.swapTx.calldata,
-        value:          plan.swapTx.value,
-        to:             plan.swapTx.to,
-      };
+      let tx: Transaction;
+      if (order.venue === 'bsc_perpetuals') {
+        tx = await this.buildPerpPosition(order);
+      } else {
+        // pancakeswap (default)
+        const plan = await this.buildSwapPlan(order);
+        tx = {
+          hash:           '0x' + '0'.repeat(64),
+          orderId:        order.id,
+          status:         'pending',
+          gasPrice:       0,
+          gasLimit:       plan.swapTx.gasLimit,
+          gasUsed:        null,
+          actualSlippage: null,
+          submittedAt:    Date.now(),
+          confirmedAt:    null,
+          blockNumber:    null,
+          error:          null,
+          calldata:       plan.swapTx.calldata,
+          value:          plan.swapTx.value,
+          to:             plan.swapTx.to,
+        };
+      }
       this.bus.emit('engine:order_routed', { orderId: order.id, venue: order.venue });
       return ok(tx);
     } catch (e) {
@@ -181,6 +193,8 @@ export class TradingEngine {
     const provider = this.requireProvider();
     const network  = cfg.network.mode === 'mainnet' ? 'mainnet' : 'testnet';
     const tokens   = TOKEN_ADDRESSES[network] ?? TOKEN_ADDRESSES['testnet']!;
+    // Always use V2 factory for pair lookups — must match V2 router
+    const v2Factory = PANCAKE_V2_FACTORY[network] ?? PANCAKE_V2_FACTORY['testnet']!;
 
     const [baseSymbol, quoteSymbol] = order.pair.split('/');
     const wbnb       = tokens['WBNB']          ?? ethers.ZeroAddress;
@@ -195,11 +209,10 @@ export class TradingEngine {
     const recipient   = this.wallet?.address ?? ethers.ZeroAddress;
     const router      = new ethers.Contract(cfg.venue.pancakeswapRouter, PANCAKE_ROUTER_ABI, provider);
 
-    let calldata:  string;
-    let value:     bigint;
-    let path:      string[];
+    let calldata:        string;
+    let value:           bigint;
+    let path:            string[];
     let spendToken:      string | null = null;
-    let spendDecimals:   number        = 18;
     let spendAmountWei:  bigint        = 0n;
 
     // Helper: get amountOutMin via getAmountsOut for real slippage protection
@@ -219,7 +232,6 @@ export class TradingEngine {
         // Buying BNB with USDT — spend USDT (ERC-20), receive BNB (native)
         // order.size is USD ≈ USDT amount (1:1 since USDT ≈ $1)
         const usdtDec    = getTokenDecimals(quoteSymbol ?? 'USDT');
-        spendDecimals    = usdtDec;
         spendAmountWei   = ethers.parseUnits(order.size.toFixed(usdtDec), usdtDec);
         path             = [quoteToken, wbnb];
         const outMin     = await getAmountOutMin(spendAmountWei, path);
@@ -251,11 +263,10 @@ export class TradingEngine {
         // Selling CAKE/ETH/BTC for BNB
         // Convert USD→token using estimated token price from pool
         const baseTokenDecimals  = getTokenDecimals(baseSymbol ?? 'CAKE');
-        // Get token price in BNB then USD using pool reserves
-        const tokenPriceInBnb = await this.getTokenPriceInBnb(baseToken, quoteToken, wbnb, provider, cfg.venue.pancakeV3Factory);
+        // Get token price in BNB then USD using V2 pool reserves
+        const tokenPriceInBnb = await this.getTokenPriceInBnb(baseToken, quoteToken, wbnb, provider, v2Factory);
         const tokenPriceUsd   = tokenPriceInBnb * this.bnbPriceUsd;
         const tokenAmount     = tokenPriceUsd > 0 ? order.size / tokenPriceUsd : order.size; // fallback: treat as raw token
-        spendDecimals         = baseTokenDecimals;
         spendAmountWei        = ethers.parseUnits(tokenAmount.toFixed(18).slice(0, 20), baseTokenDecimals);
         path                  = [baseToken, wbnb];
         const outMin          = await getAmountOutMin(spendAmountWei, path);
@@ -398,6 +409,9 @@ export class TradingEngine {
     const cfg     = this.config.get();
     const network = cfg.network.mode === 'mainnet' ? 'mainnet' : 'testnet';
     const tokens  = TOKEN_ADDRESSES[network] ?? TOKEN_ADDRESSES['testnet']!;
+    // Use V2 factory — matches the V2 router used for swaps
+    const v2Factory = PANCAKE_V2_FACTORY[network] ?? PANCAKE_V2_FACTORY['testnet']!;
+
     const [baseSymbol, quoteSymbol] = pair.split('/');
     const tokenA = tokens[baseSymbol  ?? 'WBNB'] ?? (tokens['WBNB'] ?? ethers.ZeroAddress);
     const tokenB = tokens[quoteSymbol ?? 'USDT'] ?? (tokens['USDT'] ?? ethers.ZeroAddress);
@@ -412,7 +426,7 @@ export class TradingEngine {
 
     try {
       const provider = this.requireProvider();
-      const factory  = new ethers.Contract(cfg.venue.pancakeV3Factory, PANCAKE_FACTORY_ABI, provider);
+      const factory  = new ethers.Contract(v2Factory, PANCAKE_FACTORY_ABI, provider);
       const pairAddr = await factory.getFunction('getPair')(tokenA, tokenB) as string;
       if (pairAddr === ethers.ZeroAddress) return fallback;
 
