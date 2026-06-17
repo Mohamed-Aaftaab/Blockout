@@ -13,7 +13,8 @@ export type SignalType =
   | 'macd_bullish' | 'macd_bearish'
   | 'bb_lower' | 'bb_upper'
   | 'whale_accumulation' | 'exchange_inflow'
-  | 'scalping_entry' | 'composite';
+  | 'scalping_entry' | 'composite'
+  | 'price_momentum_buy' | 'price_momentum_sell';
 
 // ─── Result Monad ────────────────────────────────────────────────────────────
 

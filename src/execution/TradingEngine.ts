@@ -151,9 +151,23 @@ export class TradingEngine {
 
   async routeOrder(order: Order): Promise<Result<Transaction, EngineError>> {
     try {
-      const tx = order.venue === 'pancakeswap'
-        ? await this.buildPancakeSwapTx(order)
-        : await this.buildPerpPosition(order);
+      const plan = await this.buildSwapPlan(order);
+      const tx: Transaction = {
+        hash:           '0x' + '0'.repeat(64),
+        orderId:        order.id,
+        status:         'pending',
+        gasPrice:       0,
+        gasLimit:       plan.swapTx.gasLimit,
+        gasUsed:        null,
+        actualSlippage: null,
+        submittedAt:    Date.now(),
+        confirmedAt:    null,
+        blockNumber:    null,
+        error:          null,
+        calldata:       plan.swapTx.calldata,
+        value:          plan.swapTx.value,
+        to:             plan.swapTx.to,
+      };
       this.bus.emit('engine:order_routed', { orderId: order.id, venue: order.venue });
       return ok(tx);
     } catch (e) {
@@ -173,61 +187,81 @@ export class TradingEngine {
     const baseToken  = tokens[baseSymbol  ?? 'BNB']  ?? wbnb;
     const quoteToken = tokens[quoteSymbol ?? 'USDT'] ?? (tokens['USDT'] ?? ethers.ZeroAddress);
 
-    const baseIsNative  = baseToken.toLowerCase()  === wbnb.toLowerCase();
-    const quoteIsNative = quoteToken.toLowerCase() === wbnb.toLowerCase();
+    const baseIsNative = baseToken.toLowerCase() === wbnb.toLowerCase();
 
     const deadline    = Math.floor(Date.now() / 1000) + 300;
     const slippageBps = Math.floor(order.slippage * 100);
     const iface       = new ethers.Interface(PANCAKE_ROUTER_ABI);
     const recipient   = this.wallet?.address ?? ethers.ZeroAddress;
+    const router      = new ethers.Contract(cfg.venue.pancakeswapRouter, PANCAKE_ROUTER_ABI, provider);
 
-    let calldata:    string;
-    let value:       bigint;
-    let path:        string[];
-    let spendToken:  string | null = null; // non-null means ERC-20 approval needed
+    let calldata:  string;
+    let value:     bigint;
+    let path:      string[];
+    let spendToken:      string | null = null;
+    let spendDecimals:   number        = 18;
+    let spendAmountWei:  bigint        = 0n;
+
+    // Helper: get amountOutMin via getAmountsOut for real slippage protection
+    async function getAmountOutMin(amountIn: bigint, swapPath: string[]): Promise<bigint> {
+      try {
+        const amounts = await router.getFunction('getAmountsOut')(amountIn, swapPath) as bigint[];
+        const expectedOut = amounts[amounts.length - 1] ?? 0n;
+        // Apply slippage tolerance
+        return (expectedOut * BigInt(10000 - slippageBps)) / BigInt(10000);
+      } catch {
+        return 0n; // fallback if pool data unavailable
+      }
+    }
 
     if (order.side === 'buy') {
       if (baseIsNative) {
         // Buying BNB with USDT — spend USDT (ERC-20), receive BNB (native)
-        // order.size is USD → USDT amount (1:1 since USDT≈$1)
-        const usdtDecimals = getTokenDecimals(quoteSymbol ?? 'USDT');
-        const amountIn     = ethers.parseUnits(order.size.toFixed(usdtDecimals), usdtDecimals);
-        const amountOutMin = 0n; // accept any BNB amount (slippage handled by confidence threshold)
-        path      = [quoteToken, wbnb];
-        calldata  = iface.encodeFunctionData('swapExactTokensForETH', [amountIn, amountOutMin, path, recipient, deadline]);
-        value     = 0n;
-        spendToken = quoteToken; // need approval for USDT
+        // order.size is USD ≈ USDT amount (1:1 since USDT ≈ $1)
+        const usdtDec    = getTokenDecimals(quoteSymbol ?? 'USDT');
+        spendDecimals    = usdtDec;
+        spendAmountWei   = ethers.parseUnits(order.size.toFixed(usdtDec), usdtDec);
+        path             = [quoteToken, wbnb];
+        const outMin     = await getAmountOutMin(spendAmountWei, path);
+        calldata         = iface.encodeFunctionData('swapExactTokensForETH', [spendAmountWei, outMin, path, recipient, deadline]);
+        value            = 0n;
+        spendToken       = quoteToken;
       } else {
-        // Buying CAKE/ETH with BNB — spend BNB (native), receive token
-        // Convert USD order size to BNB amount
-        const bnbAmount    = order.size / this.bnbPriceUsd;
-        const amountIn     = ethers.parseUnits(bnbAmount.toFixed(18).slice(0, 20), 18);
-        const amountOutMin = 0n;
-        path      = [wbnb, baseToken];
-        calldata  = iface.encodeFunctionData('swapExactETHForTokens', [amountOutMin, path, recipient, deadline]);
-        value     = amountIn;
-        spendToken = null; // native BNB, no approval needed
+        // Buying CAKE/ETH/BTC with BNB — convert USD→BNB, spend native BNB
+        const bnbAmount  = order.size / this.bnbPriceUsd;
+        spendAmountWei   = ethers.parseUnits(bnbAmount.toFixed(18).slice(0, 20), 18);
+        path             = [wbnb, baseToken];
+        const outMin     = await getAmountOutMin(spendAmountWei, path);
+        calldata         = iface.encodeFunctionData('swapExactETHForTokens', [outMin, path, recipient, deadline]);
+        value            = spendAmountWei;
+        spendToken       = null; // native BNB, no approval needed
       }
     } else {
       // sell
       if (baseIsNative) {
-        // Selling BNB for USDT — spend BNB (native), receive USDT
-        const bnbAmount    = order.size / this.bnbPriceUsd;
-        const amountIn     = ethers.parseUnits(bnbAmount.toFixed(18).slice(0, 20), 18);
-        const amountOutMin = 0n;
-        path      = [wbnb, quoteToken];
-        calldata  = iface.encodeFunctionData('swapExactETHForTokens', [amountOutMin, path, recipient, deadline]);
-        value     = amountIn;
-        spendToken = null;
+        // Selling BNB for USDT — convert USD→BNB, spend native BNB
+        const bnbAmount  = order.size / this.bnbPriceUsd;
+        spendAmountWei   = ethers.parseUnits(bnbAmount.toFixed(18).slice(0, 20), 18);
+        path             = [wbnb, quoteToken];
+        const outMin     = await getAmountOutMin(spendAmountWei, path);
+        calldata         = iface.encodeFunctionData('swapExactETHForTokens', [outMin, path, recipient, deadline]);
+        value            = spendAmountWei;
+        spendToken       = null;
       } else {
-        // Selling CAKE for BNB — spend CAKE (ERC-20), receive BNB
-        const tokenDecimals = getTokenDecimals(baseSymbol ?? 'CAKE');
-        const amountIn      = ethers.parseUnits(order.size.toFixed(tokenDecimals), tokenDecimals);
-        const amountOutMin  = 0n;
-        path       = [baseToken, wbnb];
-        calldata   = iface.encodeFunctionData('swapExactTokensForETH', [amountIn, amountOutMin, path, recipient, deadline]);
-        value      = 0n;
-        spendToken = baseToken; // need approval
+        // Selling CAKE/ETH/BTC for BNB
+        // Convert USD→token using estimated token price from pool
+        const baseTokenDecimals  = getTokenDecimals(baseSymbol ?? 'CAKE');
+        // Get token price in BNB then USD using pool reserves
+        const tokenPriceInBnb = await this.getTokenPriceInBnb(baseToken, quoteToken, wbnb, provider, cfg.venue.pancakeV3Factory);
+        const tokenPriceUsd   = tokenPriceInBnb * this.bnbPriceUsd;
+        const tokenAmount     = tokenPriceUsd > 0 ? order.size / tokenPriceUsd : order.size; // fallback: treat as raw token
+        spendDecimals         = baseTokenDecimals;
+        spendAmountWei        = ethers.parseUnits(tokenAmount.toFixed(18).slice(0, 20), baseTokenDecimals);
+        path                  = [baseToken, wbnb];
+        const outMin          = await getAmountOutMin(spendAmountWei, path);
+        calldata              = iface.encodeFunctionData('swapExactTokensForETH', [spendAmountWei, outMin, path, recipient, deadline]);
+        value                 = 0n;
+        spendToken            = baseToken; // need ERC-20 approval
       }
     }
 
@@ -249,24 +283,28 @@ export class TradingEngine {
       try {
         const erc20     = new ethers.Contract(spendToken, ERC20_ABI, provider);
         const allowance = await erc20.getFunction('allowance')(this.wallet.address, cfg.venue.pancakeswapRouter) as bigint;
-        // Determine the spend amount for comparison
-        const tokenDecimals = getTokenDecimals(quoteSymbol ?? baseSymbol ?? 'USDT');
-        const spendAmount   = ethers.parseUnits(order.size.toFixed(tokenDecimals), tokenDecimals);
-        if (allowance < spendAmount) {
-          // Approve max uint256 so we don't need to approve again
-          const approveData = new ethers.Interface(ERC20_ABI).encodeFunctionData('approve', [
+        // Use the actual spend amount (in the spend token's decimals) for comparison
+        if (allowance < spendAmountWei) {
+          const approveIface = new ethers.Interface(ERC20_ABI);
+          const approveData  = approveIface.encodeFunctionData('approve', [
             cfg.venue.pancakeswapRouter,
             ethers.MaxUint256,
           ]);
           approveTx = { to: spendToken, calldata: approveData, value: 0n };
-          logger.info('ERC-20 approval required', { token: spendToken, spender: cfg.venue.pancakeswapRouter });
+          logger.info('ERC-20 approval required', { token: spendToken, spender: cfg.venue.pancakeswapRouter, spendAmount: spendAmountWei.toString() });
         }
       } catch (e) {
-        logger.warn('Could not check allowance — will proceed without approval', { error: String(e) });
+        logger.warn('Could not check allowance — proceeding without approval (may fail)', { error: String(e) });
       }
     }
 
-    logger.info('Swap plan built', { pair: order.pair, side: order.side, path, needsApproval: approveTx !== null });
+    logger.info('Swap plan built', {
+      pair:          order.pair,
+      side:          order.side,
+      path,
+      spendAmount:   spendAmountWei.toString(),
+      needsApproval: approveTx !== null,
+    });
 
     return {
       approveTx,
@@ -274,26 +312,37 @@ export class TradingEngine {
     };
   }
 
-  private async buildPancakeSwapTx(order: Order): Promise<Transaction> {
-    const plan = await this.buildSwapPlan(order);
-    // Note: ExecutionService.executeOrder calls buildSwapPlan directly for approval handling.
-    // routeOrder returns only the swap tx for backward-compat with MEV TWAP flow.
-    return {
-      hash:           '0x' + '0'.repeat(64),
-      orderId:        order.id,
-      status:         'pending',
-      gasPrice:       0,
-      gasLimit:       plan.swapTx.gasLimit,
-      gasUsed:        null,
-      actualSlippage: null,
-      submittedAt:    Date.now(),
-      confirmedAt:    null,
-      blockNumber:    null,
-      error:          null,
-      calldata:       plan.swapTx.calldata,
-      value:          plan.swapTx.value,
-      to:             plan.swapTx.to,
-    };
+  /** Helper: get approximate token price in BNB via pool reserves */
+  private async getTokenPriceInBnb(
+    tokenAddress: string,
+    quoteAddress:  string,
+    wbnb:          string,
+    provider:      ethers.JsonRpcProvider,
+    factoryAddress:string,
+  ): Promise<number> {
+    try {
+      // Try direct token/WBNB pool first
+      const factory  = new ethers.Contract(factoryAddress, PANCAKE_FACTORY_ABI, provider);
+      const pairAddr = await factory.getFunction('getPair')(tokenAddress, wbnb) as string;
+      if (pairAddr === ethers.ZeroAddress) return 0;
+
+      const pc   = new ethers.Contract(pairAddr, PANCAKE_PAIR_ABI, provider);
+      const t0   = await pc.getFunction('token0')() as string;
+      const [r0, r1] = await pc.getFunction('getReserves')() as [bigint, bigint];
+
+      // Determine which reserve is the token and which is WBNB
+      const tokenIsToken0 = t0.toLowerCase() === tokenAddress.toLowerCase();
+      const tokenReserve  = tokenIsToken0 ? r0 : r1;
+      const bnbReserve    = tokenIsToken0 ? r1 : r0;
+
+      if (tokenReserve === 0n) return 0;
+      // Both are 18-decimal tokens on BSC (wrapped)
+      const tokenAmt = Number(ethers.formatUnits(tokenReserve, 18));
+      const bnbAmt   = Number(ethers.formatUnits(bnbReserve, 18));
+      return bnbAmt / tokenAmt; // price of 1 token in BNB
+    } catch {
+      return 0;
+    }
   }
 
   private async buildPerpPosition(order: Order): Promise<Transaction> {

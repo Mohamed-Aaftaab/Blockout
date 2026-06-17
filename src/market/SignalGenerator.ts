@@ -16,16 +16,18 @@ const logger = createLogger({
 
 // Fixed weights for composite signal — no magic numbers, all in one place
 const SIGNAL_TYPE_WEIGHTS: Record<SignalType, number> = {
-  rsi_oversold:       0.25,
-  rsi_overbought:     0.25,
-  macd_bullish:       0.25,
-  macd_bearish:       0.25,
-  bb_lower:           0.20,
-  bb_upper:           0.20,
-  whale_accumulation: 0.15,
-  exchange_inflow:    0.15,
-  scalping_entry:     1.00,
-  composite:          1.00,
+  rsi_oversold:          0.25,
+  rsi_overbought:        0.25,
+  macd_bullish:          0.25,
+  macd_bearish:          0.25,
+  bb_lower:              0.20,
+  bb_upper:              0.20,
+  whale_accumulation:    0.15,
+  exchange_inflow:       0.15,
+  scalping_entry:        1.00,
+  composite:             1.00,
+  price_momentum_buy:    0.20,
+  price_momentum_sell:   0.20,
 };
 
 // Price-momentum fallback thresholds — fires even without CMC Pro indicators
@@ -189,7 +191,6 @@ export class SignalGenerator {
     data: MarketData,
     pair: string,
   ): TradingSignal | null {
-    // Requires at least 2 candles to compute price change
     if (data.candles.length < 2) return null;
 
     const latest = data.candles[data.candles.length - 1];
@@ -200,14 +201,13 @@ export class SignalGenerator {
     const regime    = this.getDefaultRegime();
 
     if (changePct <= -MOMENTUM_DROP_PCT) {
-      // Price dropped significantly — buy the dip
       const conf = Math.min(Math.abs(changePct) / (MOMENTUM_DROP_PCT * 3), 1.0);
-      return this.buildSignal('rsi_oversold', 'buy', conf, 'momentum', pair, data.indicators, data.onChain, regime);
+      // Use dedicated price_momentum_buy type — does not collide with RSI weight
+      return this.buildSignal('price_momentum_buy', 'buy', conf, 'momentum', pair, data.indicators, data.onChain, regime);
     }
     if (changePct >= MOMENTUM_RISE_PCT) {
-      // Price rose significantly — consider selling
       const conf = Math.min(changePct / (MOMENTUM_RISE_PCT * 3), 1.0);
-      return this.buildSignal('rsi_overbought', 'sell', conf, 'momentum', pair, data.indicators, data.onChain, regime);
+      return this.buildSignal('price_momentum_sell', 'sell', conf, 'momentum', pair, data.indicators, data.onChain, regime);
     }
     return null;
   }
