@@ -215,35 +215,65 @@ export class TradingEngine {
     let spendToken:      string | null = null;
     let spendAmountWei:  bigint        = 0n;
 
-    // Helper: get amountOutMin via getAmountsOut for real slippage protection.
-    // Falls back to an estimated minimum based on BNB price if pool data is unavailable.
-    // Never falls back to 0n — that would allow sandwich bots to drain the swap.
-    const getAmountOutMin = async (amountIn: bigint, swapPath: string[]): Promise<bigint> => {
+    /**
+     * Get amountOutMin with proper fallback.
+     * @param amountIn        Input amount in the INPUT token's wei units
+     * @param swapPath        Token path for the swap
+     * @param outputDecimals  Decimal count of the OUTPUT token (18 for BNB/CAKE/ETH, 6 for USDT)
+     * @param inputIsNative   True when the input is native BNB (18 decimals)
+     */
+    const getAmountOutMin = async (
+      amountIn:       bigint,
+      swapPath:       string[],
+      outputDecimals: number,
+      inputIsNative:  boolean,
+    ): Promise<bigint> => {
       try {
         const amounts = await router.getFunction('getAmountsOut')(amountIn, swapPath) as bigint[];
         const expectedOut = amounts[amounts.length - 1] ?? 0n;
-        if (expectedOut === 0n) {
-          // Pool returned 0 expected output — fall through to price-based estimate
-          throw new Error('zero expected output');
-        }
-        // Apply slippage tolerance
+        if (expectedOut === 0n) throw new Error('zero expected output');
         return (expectedOut * BigInt(10000 - slippageBps)) / BigInt(10000);
       } catch {
-        // Fallback: estimate using BNB price. Accepts at most (1 - slippage%) of the
-        // estimated fair value. This prevents sandwich attacks even when pool data
-        // is unavailable (e.g. testnet pools not yet initialized).
-        // For WBNB→token swaps: expect approx (amountIn / 1e18 * bnbPrice) USD worth of tokens
-        // This is a conservative estimate — better than accepting any price.
-        const amountInEth = Number(ethers.formatUnits(amountIn, 18));
-        const estimatedUsdValue = amountInEth * this.bnbPriceUsd;
-        if (estimatedUsdValue > 0 && estimatedUsdValue < 1_000_000) {
-          // Use 95% of estimated value as minimum (conservative 5% slippage floor)
-          // Only apply if the estimate looks reasonable (< $1M)
-          const minFraction = Math.max(10000 - slippageBps, 9500); // at least 95%
-          return (amountIn * BigInt(minFraction)) / BigInt(10000);
+        // Fallback: compute minimum output using price estimates so we never accept 0.
+        // The key insight: we need minimum OUTPUT in OUTPUT token's units.
+        let minOutputWei: bigint;
+
+        if (inputIsNative) {
+          // Spending native BNB → receiving token (CAKE, USDT, etc.)
+          const bnbIn   = Number(ethers.formatUnits(amountIn, 18));
+          const usdIn   = bnbIn * this.bnbPriceUsd;
+          // If outputDecimals = 6 (USDT): minOut = usdIn * 0.95 in USDT units
+          // If outputDecimals = 18 (CAKE): min is harder to estimate without price; use 95% of input value
+          // Conservative: accept at least 90% of USD value in output token terms
+          const minUsd  = usdIn * 0.90;
+          if (outputDecimals === 6) {
+            // USDT/USDC output: minUsd ≈ minOut amount directly
+            minOutputWei = ethers.parseUnits(minUsd.toFixed(6), 6);
+          } else {
+            // Token output: convert USD back to BNB equivalent as floor
+            // (we can't know CAKE price here, so use a 90% of BNB input as floor in token wei)
+            const minBnb = bnbIn * 0.90;
+            minOutputWei = ethers.parseUnits(minBnb.toFixed(8), outputDecimals);
+          }
+        } else {
+          // Spending ERC-20 (USDT/CAKE) → receiving native BNB
+          if (outputDecimals === 18) {
+            // Input is USDT (6 dec), output is BNB (18 dec)
+            const usdIn     = Number(ethers.formatUnits(amountIn, 6)); // USDT ≈ USD
+            const minBnbOut = (usdIn * 0.90) / this.bnbPriceUsd;
+            minOutputWei    = ethers.parseUnits(minBnbOut.toFixed(8), 18);
+          } else {
+            // Input is some token, output is BNB: conservative 90% of input in output units
+            minOutputWei = (amountIn * 9000n) / 10000n;
+          }
         }
-        // Last resort: 95% of input amount as minimum (for stable→stable swaps)
-        return (amountIn * 9500n) / 10000n;
+
+        logger.warn('getAmountsOut unavailable — using price-based amountOutMin', {
+          minOutputWei: minOutputWei.toString(),
+          outputDecimals,
+          inputIsNative,
+        });
+        return minOutputWei;
       }
     };
 
@@ -254,7 +284,8 @@ export class TradingEngine {
         const usdtDec    = getTokenDecimals(quoteSymbol ?? 'USDT');
         spendAmountWei   = ethers.parseUnits(order.size.toFixed(usdtDec), usdtDec);
         path             = [quoteToken, wbnb];
-        const outMin     = await getAmountOutMin(spendAmountWei, path);
+        // Input: USDT (non-native), Output: BNB (18 decimals)
+        const outMin     = await getAmountOutMin(spendAmountWei, path, 18, false);
         calldata         = iface.encodeFunctionData('swapExactTokensForETH', [spendAmountWei, outMin, path, recipient, deadline]);
         value            = 0n;
         spendToken       = quoteToken;
@@ -264,7 +295,9 @@ export class TradingEngine {
         // Use 8 decimal places — sufficient precision without float representation issues
         spendAmountWei   = ethers.parseUnits(bnbAmount.toFixed(8), 18);
         path             = [wbnb, baseToken];
-        const outMin     = await getAmountOutMin(spendAmountWei, path);
+        // Input: BNB (native, 18 dec), Output: base token (e.g. CAKE, 18 dec)
+        const baseOutDec = getTokenDecimals(baseSymbol ?? 'CAKE');
+        const outMin     = await getAmountOutMin(spendAmountWei, path, baseOutDec, true);
         calldata         = iface.encodeFunctionData('swapExactETHForTokens', [outMin, path, recipient, deadline]);
         value            = spendAmountWei;
         spendToken       = null; // native BNB, no approval needed
@@ -276,7 +309,9 @@ export class TradingEngine {
         const bnbAmount  = order.size / this.bnbPriceUsd;
         spendAmountWei   = ethers.parseUnits(bnbAmount.toFixed(8), 18);
         path             = [wbnb, quoteToken];
-        const outMin     = await getAmountOutMin(spendAmountWei, path);
+        // Input: BNB (native, 18 dec), Output: quote token (e.g. USDT, 6 dec)
+        const quoteOutDec = getTokenDecimals(quoteSymbol ?? 'USDT');
+        const outMin     = await getAmountOutMin(spendAmountWei, path, quoteOutDec, true);
         calldata         = iface.encodeFunctionData('swapExactETHForTokens', [outMin, path, recipient, deadline]);
         value            = spendAmountWei;
         spendToken       = null;
@@ -290,7 +325,8 @@ export class TradingEngine {
         const tokenAmount     = tokenPriceUsd > 0 ? order.size / tokenPriceUsd : order.size; // fallback: treat as raw token
         spendAmountWei        = ethers.parseUnits(tokenAmount.toFixed(8), baseTokenDecimals);
         path                  = [baseToken, wbnb];
-        const outMin          = await getAmountOutMin(spendAmountWei, path);
+        // Input: base token (non-native, e.g. CAKE), Output: BNB (18 decimals)
+        const outMin          = await getAmountOutMin(spendAmountWei, path, 18, false);
         calldata              = iface.encodeFunctionData('swapExactTokensForETH', [spendAmountWei, outMin, path, recipient, deadline]);
         value                 = 0n;
         spendToken            = baseToken; // need ERC-20 approval

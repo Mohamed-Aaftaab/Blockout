@@ -80,10 +80,36 @@ async function bootstrap(): Promise<void> {
   regimeDet.start();
   await riskMgr.start();
 
+  // ── Live position registry — declared early so step 7 recovery can populate it ──
+  const openPositionMap = new Map<string, { position: Position; signal: TradingSignal; openedAt: number }>();
+
+  // ── Concurrency guard: one pipeline execution per pair at a time ──────────
+  const pipelineInProgress = new Set<string>();
+
   // ── [7] Recover open positions from persisted state ───────────────────────
   for (const position of currentState.openPositions) {
     riskMgr.onPositionOpened(position);
     logger.info('Recovered open position', { id: position.id, pair: position.pair });
+
+    // CRITICAL: also populate openPositionMap so SL/TP monitoring can close these
+    // positions after restart. Use a synthetic signal with the position's metadata.
+    const recoveredSignal: TradingSignal = {
+      id:         uuid(),
+      pair:       position.pair,
+      type:       'composite',
+      side:       position.side,
+      confidence: 0.5,
+      indicators: { rsi14: 50, macdLine: 0, macdSignal: 0, macdHistogram: 0, bbUpper: 0, bbMiddle: 0, bbLower: 0, ma20: 0, ma50: 0, bbWidth: 5 },
+      onChain:    { whaleNetFlow24h: 0, exchangeInflow24h: 0, exchangeOutflow24h: 0, largeTransactions: 0 },
+      regime:     'sideways',
+      strategy:   position.strategy,
+      timestamp:  position.openedAt,
+    };
+    openPositionMap.set(position.id, {
+      position,
+      signal:    recoveredSignal,
+      openedAt:  position.openedAt,
+    });
   }
 
   // ── [8] Strategies ────────────────────────────────────────────────────────
@@ -98,12 +124,6 @@ async function bootstrap(): Promise<void> {
   stratMgr.registerStrategy(meanRev);
   stratMgr.registerStrategy(range);
   stratMgr.start();
-
-  // ── Live position registry (truth source across closures) ─────────────────
-  const openPositionMap = new Map<string, { position: Position; signal: TradingSignal; openedAt: number }>();
-
-  // ── Concurrency guard: one pipeline execution per pair at a time ──────────
-  const pipelineInProgress = new Set<string>();
 
   // ── [8b] market:data → SignalGenerator pipeline ───────────────────────────
   bus.on('market:data', ({ pair, data }) => {
