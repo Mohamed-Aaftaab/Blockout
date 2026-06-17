@@ -1,14 +1,10 @@
 import * as fs from 'fs';
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus } from '../events/EventBus';
 import type { CircuitState } from '../types/index';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 export class HealthMonitor {
   private readonly config: ConfigurationService;
@@ -36,6 +32,12 @@ export class HealthMonitor {
     this.shutdownPollInterval = setInterval(() => {
       this.pollShutdownSignal();
     }, cfg.shutdownPollMs);
+
+    // Wire circuit state to RiskManager's circuit breaker events
+    this.bus.on('risk:circuit_breaker', () => {
+      this.circuitState = 'OPEN';
+      logger.warn('Circuit state: OPEN (circuit breaker triggered)');
+    });
 
     logger.info('HealthMonitor started', { networkMode: cfg.network.mode });
   }

@@ -1,4 +1,4 @@
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
 import type {
@@ -8,11 +8,7 @@ import type {
 import type { MarketDataService } from './MarketDataService';
 import { uuid } from '../utils/uuid';
 
-const logger = createLogger({
-  level: process.env['LOG_LEVEL'] ?? 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 // Fixed weights for composite signal — no magic numbers, all in one place
 const SIGNAL_TYPE_WEIGHTS: Record<SignalType, number> = {

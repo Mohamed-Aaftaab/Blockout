@@ -2,18 +2,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { z } from 'zod';
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus } from '../events/EventBus';
 import type { SystemState, Position, Transaction } from '../types/index';
 import { ok, err, type Result } from '../types/index';
 import { StateError } from '../types/errors';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 // ─── Zod schemas ─────────────────────────────────────────────────────────────
 

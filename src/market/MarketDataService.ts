@@ -1,5 +1,5 @@
 import axios, { type AxiosInstance } from 'axios';
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus } from '../events/EventBus';
 import type {
@@ -8,11 +8,7 @@ import type {
 import type { TradingEngine } from '../execution/TradingEngine';
 import { withRetry } from '../utils/backoff';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 const CMC_BASE = 'https://pro-api.coinmarketcap.com';
 

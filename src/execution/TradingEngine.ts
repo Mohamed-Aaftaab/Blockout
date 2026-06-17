@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus } from '../events/EventBus';
 import type { Order, Transaction } from '../types/index';
@@ -96,11 +96,7 @@ export interface SwapPlan {
   };
 }
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 export class TradingEngine {
   private provider:        ethers.JsonRpcProvider | null = null;
@@ -110,6 +106,8 @@ export class TradingEngine {
   private readonly bus:    EventBus;
   /** CMC-sourced BNB price. Updated by MarketDataService. Fallback: $300 */
   private bnbPriceUsd: number = 300;
+  /** Portfolio value cache (5s TTL) — prevents N+1 RPC calls per signal */
+  private portfolioCache: { value: number; expiresAt: number } = { value: 0, expiresAt: 0 };
 
   constructor(config: ConfigurationService, bus: EventBus) {
     this.config = config;
@@ -403,10 +401,23 @@ export class TradingEngine {
       const bnbReserve    = tokenIsToken0 ? r1 : r0;
 
       if (tokenReserve === 0n) return 0;
-      // Both are 18-decimal tokens on BSC (wrapped)
-      const tokenAmt = Number(ethers.formatUnits(tokenReserve, 18));
-      const bnbAmt   = Number(ethers.formatUnits(bnbReserve, 18));
-      return bnbAmt / tokenAmt; // price of 1 token in BNB
+      // Look up the correct decimal count for this token from the address map.
+      // WBNB is always 18; USDT/USDC use 6; everything else defaults to 18.
+      const cfg2    = this.config.get();
+      const net2    = cfg2.network.mode === 'mainnet' ? 'mainnet' : 'testnet';
+      const tokMap  = TOKEN_ADDRESSES[net2] ?? TOKEN_ADDRESSES['testnet']!;
+      const addrLow = tokenAddress.toLowerCase();
+      let tokenDecimals = 18;
+      for (const [sym, addr] of Object.entries(tokMap)) {
+        if (addr.toLowerCase() === addrLow) {
+          tokenDecimals = getTokenDecimals(sym);
+          break;
+        }
+      }
+      const tokenAmt = Number(ethers.formatUnits(tokenReserve, tokenDecimals));
+      const bnbAmt   = Number(ethers.formatUnits(bnbReserve, 18)); // WBNB always 18
+      if (tokenAmt === 0) return 0;
+      return bnbAmt / tokenAmt;
     } catch {
       return 0;
     }
@@ -499,7 +510,20 @@ export class TradingEngine {
       const [r0, r1]  = await pc.getFunction('getReserves')() as [bigint, bigint];
       const t0        = await pc.getFunction('token0')() as string;
       const t1        = await pc.getFunction('token1')() as string;
-      return { reserve0: r0, reserve1: r1, token0: t0, token1: t1, token0Symbol: baseSymbol ?? 'BNB', token1Symbol: quoteSymbol ?? 'USDT', pairAddress: pairAddr, fetchedAt: Date.now() };
+
+      // PancakeSwap sorts tokens by address on pair creation, so t0 may not match tokenA.
+      // Derive symbol labels from addresses to keep PoolAnalyzer decimals correct.
+      const tokenALower   = tokenA.toLowerCase();
+      const t0IsTokenA    = t0.toLowerCase() === tokenALower;
+      const actual0Symbol = t0IsTokenA ? (baseSymbol ?? 'BNB') : (quoteSymbol ?? 'USDT');
+      const actual1Symbol = t0IsTokenA ? (quoteSymbol ?? 'USDT') : (baseSymbol ?? 'BNB');
+
+      return {
+        reserve0: r0, reserve1: r1, token0: t0, token1: t1,
+        token0Symbol: actual0Symbol,
+        token1Symbol: actual1Symbol,
+        pairAddress: pairAddr, fetchedAt: Date.now(),
+      };
     } catch {
       return fallback;
     }
@@ -589,6 +613,12 @@ export class TradingEngine {
       const address = walletAddress ?? this.wallet?.address;
       if (!address) return 0;
 
+      // Short-lived cache (5s) to prevent 13+ RPC calls per signal invocation
+      const now = Date.now();
+      if (now < this.portfolioCache.expiresAt && this.portfolioCache.value > 0) {
+        return this.portfolioCache.value;
+      }
+
       const cfg     = this.config.get();
       const network = cfg.network.mode === 'mainnet' ? 'mainnet' : 'testnet';
       const tokens  = TOKEN_ADDRESSES[network] ?? TOKEN_ADDRESSES['testnet']!;
@@ -607,7 +637,6 @@ export class TradingEngine {
         const tokenBalWei = await this.getERC20Balance(tokenAddr, address);
         if (tokenBalWei === 0n) continue;
 
-        // Convert token balance → USD via pool price
         const tokenPriceInBnb = await this.getTokenPriceInBnb(tokenAddr, wbnb, this.requireProvider(),
           PANCAKE_V2_FACTORY[network] ?? PANCAKE_V2_FACTORY['testnet']!);
         if (tokenPriceInBnb > 0) {
@@ -617,10 +646,16 @@ export class TradingEngine {
         }
       }
 
+      this.portfolioCache = { value: totalUsd, expiresAt: now + 5_000 };
       return totalUsd;
     } catch {
       return 0;
     }
+  }
+
+  /** Invalidate portfolio cache — call after a swap so next read reflects the change */
+  invalidatePortfolioCache(): void {
+    this.portfolioCache = { value: 0, expiresAt: 0 };
   }
 
   async failoverRPC(): Promise<boolean> {

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
 import type {
@@ -8,11 +8,7 @@ import type {
   VenueMetrics, StrategyMetrics, Venue,
 } from '../types/index';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 export class AnalyticsEngine {
   private readonly config:   ConfigurationService;

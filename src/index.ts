@@ -1,4 +1,4 @@
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from './utils/logger';
 import { ConfigurationService }      from './config/index';
 import { EventBus }                  from './events/EventBus';
 import { TradingEngine }             from './execution/TradingEngine';
@@ -23,11 +23,7 @@ import type {
 } from './types/index';
 import { uuid } from './utils/uuid';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 /**
  * Lightweight async mutex — ensures sequential state saves.
@@ -99,8 +95,15 @@ async function bootstrap(): Promise<void> {
   regimeDet.start();
   await riskMgr.start();
 
+  // Restore persisted drawdown baseline so it survives restarts correctly
+  if (currentState.drawdownBaseline > 0) {
+    riskMgr.restoreDrawdownBaseline(currentState.drawdownBaseline);
+    logger.info('Drawdown baseline restored from persisted state', { baseline: currentState.drawdownBaseline });
+  }
+
   // ── Live position registry — declared early so step 7 recovery can populate it ──
-  const openPositionMap = new Map<string, { position: Position; signal: TradingSignal; openedAt: number }>();
+  // closeRetries tracks failed close attempts per position to cap retries at 5.
+  const openPositionMap = new Map<string, { position: Position; signal: TradingSignal; openedAt: number; closeRetries: number }>();
 
   // ── Concurrency guard: one pipeline execution per pair at a time ──────────
   const pipelineInProgress = new Set<string>();
@@ -128,6 +131,7 @@ async function bootstrap(): Promise<void> {
       position,
       signal:    recoveredSignal,
       openedAt:  position.openedAt,
+      closeRetries: 0,
     });
   }
 
@@ -319,7 +323,7 @@ async function bootstrap(): Promise<void> {
       };
 
       riskMgr.onPositionOpened(position);
-      openPositionMap.set(position.id, { position, signal, openedAt: signalTimestamp });
+      openPositionMap.set(position.id, { position, signal, openedAt: signalTimestamp, closeRetries: 0 });
 
       // Serialised state update — prevents race with concurrent handlePositionClose
       await stateMutex.run(async () => {
@@ -364,21 +368,32 @@ async function bootstrap(): Promise<void> {
     const entry = openPositionMap.get(positionId);
     if (!entry) return;
 
-    const { position, signal, openedAt } = entry;
+    const { position, signal, openedAt, closeRetries } = entry;
     openPositionMap.delete(positionId);
     riskMgr.onPositionClosed(positionId);
 
-    // ── Issue S: cap close size to actual token balance to prevent on-chain reverts ──
-    // When a buy swap partially filled, fewer tokens landed in the wallet than expected.
-    // Reading the actual ERC-20 balance prevents the close order from reverting.
+    // ── Balance cap: prevent on-chain reverts from partial fills ──────────────
+    // For buy positions (closing = sell base token): check ERC-20 balance.
+    // For sell positions (closing = buy back using quote token): check quote balance.
     let closeSize = position.size;
     if (position.side === 'buy') {
-      const actualTokenBalance = await executionSvc.getBaseTokenBalance(position.pair);
-      if (actualTokenBalance !== null && actualTokenBalance < position.size) {
-        logger.warn('Close size capped to actual on-chain token balance', {
-          positionId, expected: position.size, actual: actualTokenBalance,
+      const actualBalance = await executionSvc.getBaseTokenBalance(position.pair);
+      if (actualBalance !== null && actualBalance < position.size) {
+        logger.warn('Close size capped to actual base token balance', {
+          positionId, expected: position.size, actual: actualBalance,
         });
-        closeSize = actualTokenBalance;
+        closeSize = actualBalance;
+      }
+    } else {
+      const [, quoteSymbol] = position.pair.split('/');
+      if (quoteSymbol && quoteSymbol !== 'BNB' && quoteSymbol !== 'WBNB') {
+        const quoteBalance = await executionSvc.getQuoteTokenBalance(position.pair);
+        if (quoteBalance !== null && quoteBalance < position.size) {
+          logger.warn('Close size capped to actual quote token balance (sell position)', {
+            positionId, expected: position.size, actual: quoteBalance,
+          });
+          closeSize = quoteBalance;
+        }
       }
     }
 
@@ -414,23 +429,35 @@ async function bootstrap(): Promise<void> {
 
     const execResult = await executionSvc.executeOrder(closeOrder);
 
-    // ── Issue K: if close execution fails, restore position to prevent state corruption ──
-    // Without this, the position disappears from internal maps but stays open on-chain,
-    // causing a mismatch between internal state and actual wallet holdings.
+    // ── Issue K: cap retries at 5 to prevent infinite retry loop ──────────────
     if (!execResult.ok) {
-      logger.error('Close order failed — restoring position to maps so SL/TP can retry', {
-        positionId, pair: position.pair, reason, error: execResult.error.message,
-      });
-      openPositionMap.set(positionId, { position, signal, openedAt });
-      riskMgr.onPositionOpened(position);
-      bus.emit('health:warning', {
-        component: 'handlePositionClose',
-        message:   `Close order failed for ${positionId}: ${execResult.error.message}`,
-      });
-      return;
+      const newRetries = closeRetries + 1;
+      const maxRetries = 5;
+      if (newRetries >= maxRetries) {
+        logger.error('Close order failed after max retries — emitting critical alert', {
+          positionId, pair: position.pair, reason, retries: newRetries, error: execResult.error.message,
+        });
+        bus.emit('health:critical', {
+          component: 'handlePositionClose',
+          message:   `Position ${positionId} stuck after ${maxRetries} close attempts: ${execResult.error.message}`,
+          timestamp: Date.now(),
+        });
+        // Fall through to cleanup so internal state doesn't show it as open forever
+      } else {
+        logger.error('Close order failed — restoring position for SL/TP retry', {
+          positionId, pair: position.pair, reason, retries: newRetries, error: execResult.error.message,
+        });
+        openPositionMap.set(positionId, { position, signal, openedAt, closeRetries: newRetries });
+        riskMgr.onPositionOpened(position);
+        bus.emit('health:warning', {
+          component: 'handlePositionClose',
+          message:   `Close attempt ${newRetries}/${maxRetries} failed for ${positionId}: ${execResult.error.message}`,
+        });
+        return;
+      }
     }
 
-    const closeTxs = [execResult.value];
+    const closeTxs = execResult.ok ? [execResult.value] : [];
 
     // PnL calculation — correct for both long (buy) and short (sell)
     const pnlUsd = position.side === 'buy'
@@ -495,7 +522,11 @@ async function bootstrap(): Promise<void> {
   // even during quiet periods when no positions open or close.
   const statePersistInterval = setInterval(() => {
     void stateMutex.run(async () => {
-      await stateMgr.saveState(currentState);
+      // Sync drawdown baseline from RiskManager so it survives restarts
+      await stateMgr.saveState({
+        ...currentState,
+        drawdownBaseline: riskMgr.getDrawdownBaseline(),
+      });
     });
   }, cfg.statePersistSec * 1000);
 

@@ -1,4 +1,4 @@
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
 import type { Position, Order, Result } from '../types/index';
@@ -6,11 +6,7 @@ import { ok, err }                   from '../types/index';
 import { RiskError }                 from '../types/errors';
 import type { TradingEngine }        from '../execution/TradingEngine';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 export class RiskManager {
   private readonly engine:   TradingEngine;
@@ -105,6 +101,17 @@ export class RiskManager {
 
   onPositionClosed(positionId: string): void {
     this.openPositions.delete(positionId);
+  }
+
+  getDrawdownBaseline(): number {
+    return this.drawdownBaseline;
+  }
+
+  /** Restore the drawdown baseline from persisted state on agent restart */
+  restoreDrawdownBaseline(baseline: number): void {
+    if (baseline > 0) {
+      this.drawdownBaseline = baseline;
+    }
   }
 
   triggerCircuitBreaker(reason: string): void {

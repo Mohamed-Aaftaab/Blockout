@@ -1,5 +1,5 @@
 import { ethers } from 'ethers';
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
 import type { PoolHealth }           from '../types/index';
@@ -15,11 +15,7 @@ function getTokenDecimals(symbol: string): number {
   return TOKEN_DECIMALS[symbol] ?? 18;
 }
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 export class PoolAnalyzer {
   private readonly engine: TradingEngine;

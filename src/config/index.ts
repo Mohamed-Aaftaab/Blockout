@@ -1,15 +1,11 @@
 import { z } from 'zod';
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import { ConfigSchema } from './schema';
 import type { Config } from '../types/index';
 import { ok, err, type Result } from '../types/index';
 import { ConfigValidationError } from '../types/errors';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 /**
  * Parse a boolean env var string ('true'/'1' → true, anything else → false).

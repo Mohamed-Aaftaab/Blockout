@@ -1,4 +1,4 @@
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
 import type { TradingSignal, Order } from '../types/index';
@@ -6,11 +6,7 @@ import type { IStrategy }            from './IStrategy';
 import type { SignalGenerator }      from '../market/SignalGenerator';
 import type { RegimeDetector }       from '../market/RegimeDetector';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 // Map each strategy name to the confidence score of the signal it last acted on
 // so resolveConflict can pick the highest-confidence signal

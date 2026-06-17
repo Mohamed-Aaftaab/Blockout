@@ -1,14 +1,10 @@
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
 import type { MarketData, MarketRegime } from '../types/index';
 import type { MarketDataService }    from './MarketDataService';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 export class RegimeDetector {
   private readonly marketData:     MarketDataService;

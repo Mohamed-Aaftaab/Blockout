@@ -1,14 +1,10 @@
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus } from '../events/EventBus';
 import type { Order, Transaction, TwapParams } from '../types/index';
 import { sleep } from '../utils/sleep';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 export class MEVDefenseModule {
   private readonly config: ConfigurationService;

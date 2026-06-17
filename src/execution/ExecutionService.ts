@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 import * as fs    from 'fs';
 import * as path  from 'path';
-import { createLogger, transports, format } from 'winston';
+import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
 import type { Order, Transaction, Result } from '../types/index';
@@ -13,11 +13,7 @@ import { sleep }                     from '../utils/sleep';
 
 const WALLET_KEY_FILE = './data/wallet.key';
 
-const logger = createLogger({
-  level: 'info',
-  format: format.combine(format.timestamp(), format.json()),
-  transports: [new transports.Console()],
-});
+const logger = makeLogger();
 
 export class ExecutionService {
   private readonly engine:       TradingEngine;
@@ -100,6 +96,8 @@ export class ExecutionService {
         const confirmed = await this.awaitConfirmation(swapHash, cfg.txTimeoutSec * 1000);
         if (!confirmed.ok) return confirmed;
 
+        // Invalidate portfolio cache so next portfolio read reflects the swap
+        this.engine.invalidatePortfolioCache();
         return ok({ ...confirmed.value, orderId: order.id, gasPrice });
       } catch (e) {
         const errMsg = String(e);
@@ -154,6 +152,7 @@ export class ExecutionService {
       const swapHash = await this.sendRawTx(plan.swapTx.to, plan.swapTx.calldata, plan.swapTx.value, actualGasPrice, plan.swapTx.gasLimit);
       const confirmed = await this.awaitConfirmation(swapHash, 120_000);
       if (!confirmed.ok) return confirmed;
+      this.engine.invalidatePortfolioCache();
       return ok({ ...confirmed.value, orderId: chunk.id, gasPrice: actualGasPrice });
     } catch (e) {
       return err(new ExecutionError(String(e), chunk.id, 'unknown'));
@@ -244,9 +243,20 @@ export class ExecutionService {
     if (!this.wallet) return null;
     const [baseSymbol] = pair.split('/');
     if (!baseSymbol) return null;
-    // Native BNB pairs don't need an ERC-20 balance check
     if (baseSymbol === 'BNB' || baseSymbol === 'WBNB') return null;
     const balanceUsd = await this.engine.getBaseTokenBalanceUsd(baseSymbol, this.wallet.address);
+    return balanceUsd;
+  }
+
+  /**
+   * Returns the wallet's on-chain quote token balance in USD.
+   * Used before issuing a buy-to-close on a sell position to prevent reverts.
+   */
+  async getQuoteTokenBalance(pair: string): Promise<number | null> {
+    if (!this.wallet) return null;
+    const [, quoteSymbol] = pair.split('/');
+    if (!quoteSymbol || quoteSymbol === 'BNB' || quoteSymbol === 'WBNB') return null;
+    const balanceUsd = await this.engine.getBaseTokenBalanceUsd(quoteSymbol, this.wallet.address);
     return balanceUsd;
   }
 
