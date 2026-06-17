@@ -10,22 +10,33 @@ export class MidBattleScalpingStrategy implements IStrategy {
   weight:   number;
   isActive: boolean = true;
 
-  private readonly config: ConfigurationService;
-  private readonly bus:    EventBus;
-  private readonly athMap: Map<string, number> = new Map();
+  private readonly config:   ConfigurationService;
+  private readonly bus:      EventBus;
+  private readonly athMap:   Map<string, number> = new Map();
+  // Track last known real price per pair (updated via onMarketData)
+  private readonly lastPrices: Map<string, number> = new Map();
 
   constructor(config: ConfigurationService, bus: EventBus) {
     this.config = config;
     this.bus    = bus;
-    this.weight = 0.4; // default weight — adjusted by StrategyManager
+    this.weight = 0.4;
   }
 
   onMarketData(data: MarketData): void {
+    // Store real current price
+    this.lastPrices.set(data.pair, data.price);
+    // Update ATH using the real price
     this.updateATH(data.pair, data.price);
   }
 
   onSignal(signal: TradingSignal, _regime: MarketRegime): Order | null {
-    if (!this.isDipConditionMet(signal.pair, signal.indicators.ma20 || 0)) {
+    // Use real current price from onMarketData, not an indicator value
+    const currentPrice = this.lastPrices.get(signal.pair) ?? 0;
+
+    // Can't evaluate dip without a known price
+    if (currentPrice === 0) return null;
+
+    if (!this.isDipConditionMet(signal.pair, currentPrice)) {
       return null;
     }
 
@@ -46,12 +57,13 @@ export class MidBattleScalpingStrategy implements IStrategy {
 
   private updateATH(pair: string, price: number): void {
     const current = this.athMap.get(pair) ?? 0;
+    // ATH only increases, never decreases
     if (price > current) this.athMap.set(pair, price);
   }
 
   private isDipConditionMet(pair: string, price: number): boolean {
     const ath = this.athMap.get(pair) ?? 0;
-    if (ath === 0) return false;
+    if (ath === 0) return false; // no ATH tracked yet
     const cfg      = this.config.get().scalping;
     const dipLevel = ath * (1 - cfg.athDropPct / 100);
     return price <= dipLevel;

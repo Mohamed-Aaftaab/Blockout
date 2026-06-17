@@ -9,12 +9,13 @@ import type { MarketDataService } from './MarketDataService';
 import { uuid } from '../utils/uuid';
 
 const logger = createLogger({
-  level: 'info',
+  level: 'debug',
   format: format.combine(format.timestamp(), format.json()),
   transports: [new transports.Console()],
 });
 
-const WEIGHT_MAP: Record<SignalType, number> = {
+// Fixed weights for composite signal — no magic numbers, all in one place
+const SIGNAL_TYPE_WEIGHTS: Record<SignalType, number> = {
   rsi_oversold:       0.25,
   rsi_overbought:     0.25,
   macd_bullish:       0.25,
@@ -32,11 +33,7 @@ export class SignalGenerator {
   private readonly config:     ConfigurationService;
   private readonly bus:        EventBus;
 
-  constructor(
-    marketData: MarketDataService,
-    config:     ConfigurationService,
-    bus:        EventBus,
-  ) {
+  constructor(marketData: MarketDataService, config: ConfigurationService, bus: EventBus) {
     this.marketData = marketData;
     this.config     = config;
     this.bus        = bus;
@@ -44,13 +41,11 @@ export class SignalGenerator {
 
   generateSignals(pair: string, data: MarketData): TradingSignal[] {
     const signals: TradingSignal[] = [];
-    const ind  = data.indicators;
-    const oc   = data.onChain;
 
-    const rsi  = this.computeRSISignal(ind, pair, data.indicators, data.onChain);
-    const macd = this.computeMACDSignal(ind, pair, data.indicators, data.onChain);
-    const bb   = this.computeBollingerSignal(ind, pair, data.price, data.indicators, data.onChain);
-    const whal = this.computeWhaleSignal(oc, pair, data.indicators, data.onChain);
+    const rsi  = this.computeRSISignal(data.indicators, pair, data.onChain);
+    const macd = this.computeMACDSignal(data.indicators, pair, data.onChain);
+    const bb   = this.computeBollingerSignal(data.indicators, pair, data.price, data.onChain);
+    const whal = this.computeWhaleSignal(data.onChain, pair, data.indicators);
 
     if (rsi  !== null) signals.push(rsi);
     if (macd !== null) signals.push(macd);
@@ -61,110 +56,123 @@ export class SignalGenerator {
   }
 
   computeCompositeSignal(signals: TradingSignal[]): TradingSignal {
+    const defaultIndicators = this.defaultIndicators();
+    const defaultOnChain    = this.defaultOnChain();
+
     if (signals.length === 0) {
-      return this.buildSignal('composite', 'buy', 0, 'composite',
-        signals[0]?.pair ?? 'unknown',
-        signals[0]?.indicators ?? this.defaultIndicators(),
-        signals[0]?.onChain    ?? this.defaultOnChain(),
-        signals[0]?.regime     ?? 'sideways',
-      );
+      return this.buildSignal('composite', 'buy', 0, 'composite', 'unknown',
+        defaultIndicators, defaultOnChain, 'sideways');
     }
 
-    let totalWeight = 0;
+    let totalWeight  = 0;
     let weightedConf = 0;
-    let buyVotes  = 0;
-    let sellVotes = 0;
+    let buyVotes     = 0;
+    let sellVotes    = 0;
 
     for (const s of signals) {
-      const w = WEIGHT_MAP[s.type] ?? 1.0;
+      const w = SIGNAL_TYPE_WEIGHTS[s.type] ?? 1.0;
       weightedConf += s.confidence * w;
       totalWeight  += w;
       if (s.side === 'buy') buyVotes++;
       else                  sellVotes++;
     }
 
-    const confidence = totalWeight > 0
-      ? Math.min(weightedConf / totalWeight, 1.0)
-      : 0;
+    const confidence = totalWeight > 0 ? Math.min(weightedConf / totalWeight, 1.0) : 0;
     const side: OrderSide = buyVotes >= sellVotes ? 'buy' : 'sell';
 
-    const first = signals[0];
+    const first = signals[0]!;
     const composite = this.buildSignal(
       'composite', side, confidence, 'composite',
-      first?.pair        ?? 'unknown',
-      first?.indicators  ?? this.defaultIndicators(),
-      first?.onChain     ?? this.defaultOnChain(),
-      first?.regime      ?? 'sideways',
+      first.pair, first.indicators, first.onChain, first.regime,
     );
 
     this.bus.emit('signal:generated', composite);
+
+    logger.debug('Composite signal generated', {
+      pair:       composite.pair,
+      side:       composite.side,
+      confidence: composite.confidence.toFixed(3),
+      regime:     composite.regime,
+      components: signals.map(s => s.type),
+    });
+
     return composite;
   }
 
   private computeRSISignal(
-    ind: TechnicalIndicators, pair: string,
-    indicators: TechnicalIndicators, onChain: OnChainMetrics,
+    indicators: TechnicalIndicators,
+    pair:       string,
+    onChain:    OnChainMetrics,
   ): TradingSignal | null {
-    const cfg = this.config.get().signal;
-    const regime: MarketRegime = 'sideways';
-    if (ind.rsi14 < cfg.rsiOversold) {
-      const conf = Math.min((cfg.rsiOversold - ind.rsi14) / cfg.rsiOversold, 1.0);
+    const cfg    = this.config.get().signal;
+    const regime = this.getDefaultRegime();
+
+    if (indicators.rsi14 < cfg.rsiOversold) {
+      const conf = Math.min((cfg.rsiOversold - indicators.rsi14) / cfg.rsiOversold, 1.0);
       return this.buildSignal('rsi_oversold', 'buy', conf, 'rsi', pair, indicators, onChain, regime);
     }
-    if (ind.rsi14 > cfg.rsiOverbought) {
-      const conf = Math.min((ind.rsi14 - cfg.rsiOverbought) / (100 - cfg.rsiOverbought), 1.0);
+    if (indicators.rsi14 > cfg.rsiOverbought) {
+      const conf = Math.min((indicators.rsi14 - cfg.rsiOverbought) / (100 - cfg.rsiOverbought), 1.0);
       return this.buildSignal('rsi_overbought', 'sell', conf, 'rsi', pair, indicators, onChain, regime);
     }
     return null;
   }
 
   private computeMACDSignal(
-    ind: TechnicalIndicators, pair: string,
-    indicators: TechnicalIndicators, onChain: OnChainMetrics,
+    indicators: TechnicalIndicators,
+    pair:       string,
+    onChain:    OnChainMetrics,
   ): TradingSignal | null {
-    const regime: MarketRegime = 'sideways';
-    const histAbs = Math.abs(ind.macdHistogram);
-    const maxHist = 10;
-    const conf = Math.min(histAbs / maxHist, 1.0);
-    if (ind.macdLine > ind.macdSignal && ind.macdHistogram > 0) {
+    const regime  = this.getDefaultRegime();
+    const histAbs = Math.abs(indicators.macdHistogram);
+    const maxHist = 10; // normalizer — histogram magnitudes rarely exceed 10 in practice
+    const conf    = Math.min(histAbs / maxHist, 1.0);
+
+    if (indicators.macdLine > indicators.macdSignal && indicators.macdHistogram > 0) {
       return this.buildSignal('macd_bullish', 'buy', conf, 'macd', pair, indicators, onChain, regime);
     }
-    if (ind.macdLine < ind.macdSignal && ind.macdHistogram < 0) {
+    if (indicators.macdLine < indicators.macdSignal && indicators.macdHistogram < 0) {
       return this.buildSignal('macd_bearish', 'sell', conf, 'macd', pair, indicators, onChain, regime);
     }
     return null;
   }
 
   private computeBollingerSignal(
-    ind: TechnicalIndicators, pair: string, price: number,
-    indicators: TechnicalIndicators, onChain: OnChainMetrics,
+    indicators: TechnicalIndicators,
+    pair:       string,
+    price:      number,
+    onChain:    OnChainMetrics,
   ): TradingSignal | null {
-    const regime: MarketRegime = 'sideways';
-    const band = ind.bbUpper - ind.bbLower;
+    const regime = this.getDefaultRegime();
+    const band   = indicators.bbUpper - indicators.bbLower;
     if (band <= 0) return null;
-    if (price <= ind.bbLower) {
-      const conf = Math.min((ind.bbLower - price) / band + 0.5, 1.0);
+
+    if (price <= indicators.bbLower) {
+      // Confidence increases the further below the lower band price is
+      const conf = Math.min((indicators.bbLower - price) / band + 0.5, 1.0);
       return this.buildSignal('bb_lower', 'buy', conf, 'bollinger', pair, indicators, onChain, regime);
     }
-    if (price >= ind.bbUpper) {
-      const conf = Math.min((price - ind.bbUpper) / band + 0.5, 1.0);
+    if (price >= indicators.bbUpper) {
+      const conf = Math.min((price - indicators.bbUpper) / band + 0.5, 1.0);
       return this.buildSignal('bb_upper', 'sell', conf, 'bollinger', pair, indicators, onChain, regime);
     }
     return null;
   }
 
   private computeWhaleSignal(
-    oc: OnChainMetrics, pair: string,
-    indicators: TechnicalIndicators, onChain: OnChainMetrics,
+    onChain:    OnChainMetrics,
+    pair:       string,
+    indicators: TechnicalIndicators,
   ): TradingSignal | null {
-    const cfg = this.config.get().signal;
-    const regime: MarketRegime = 'sideways';
-    if (oc.whaleNetFlow24h > cfg.whaleBuyThresholdUsd) {
-      const conf = Math.min(oc.whaleNetFlow24h / (cfg.whaleBuyThresholdUsd * 2), 1.0);
+    const cfg    = this.config.get().signal;
+    const regime = this.getDefaultRegime();
+
+    if (onChain.whaleNetFlow24h > cfg.whaleBuyThresholdUsd) {
+      const conf = Math.min(onChain.whaleNetFlow24h / (cfg.whaleBuyThresholdUsd * 2), 1.0);
       return this.buildSignal('whale_accumulation', 'buy', conf, 'onchain', pair, indicators, onChain, regime);
     }
-    if (oc.exchangeInflow24h > cfg.exchangeInflowUsd) {
-      const conf = Math.min(oc.exchangeInflow24h / (cfg.exchangeInflowUsd * 2), 1.0);
+    if (onChain.exchangeInflow24h > cfg.exchangeInflowUsd) {
+      const conf = Math.min(onChain.exchangeInflow24h / (cfg.exchangeInflowUsd * 2), 1.0);
       return this.buildSignal('exchange_inflow', 'sell', conf, 'onchain', pair, indicators, onChain, regime);
     }
     return null;
@@ -181,12 +189,20 @@ export class SignalGenerator {
     regime:     MarketRegime,
   ): TradingSignal {
     return {
-      id: uuid(), pair, type, side,
+      id:         uuid(),
+      pair,
+      type,
+      side,
       confidence: Math.max(0, Math.min(confidence, 1.0)),
-      indicators, onChain, regime, strategy,
-      timestamp: Date.now(),
+      indicators,
+      onChain,
+      regime,
+      strategy,
+      timestamp:  Date.now(),
     };
   }
+
+  private getDefaultRegime(): MarketRegime { return 'sideways'; }
 
   private defaultIndicators(): TechnicalIndicators {
     return {
