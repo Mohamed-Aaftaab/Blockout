@@ -105,6 +105,12 @@ async function bootstrap(): Promise<void> {
     });
   }
 
+  // Restore circuit breaker state — if the agent crashed with an active circuit breaker,
+  // it should remain active on restart to prevent resuming trading after a drawdown event.
+  if (currentState.circuitBreakerActive) {
+    riskMgr.restoreCircuitBreakerState(true);
+  }
+
   // ── Live position registry — declared early so step 7 recovery can populate it ──
   // closeRetries tracks failed close attempts per position to cap retries at 5.
   const openPositionMap = new Map<string, { position: Position; signal: TradingSignal; openedAt: number; closeRetries: number }>();
@@ -465,10 +471,11 @@ async function bootstrap(): Promise<void> {
 
     const closeTxs = execResult.ok ? [execResult.value] : [];
 
-    // PnL calculation — correct for both long (buy) and short (sell)
+    // PnL calculation — use closeSize (what was actually closed) not position.size
+    // (which may have been capped by partial fill balance check above).
     const pnlUsd = position.side === 'buy'
-      ? (exitPrice - position.entryPrice) / position.entryPrice * position.size
-      : (position.entryPrice - exitPrice) / position.entryPrice * position.size;
+      ? (exitPrice - position.entryPrice) / position.entryPrice * closeSize
+      : (position.entryPrice - exitPrice) / position.entryPrice * closeSize;
     const pnlPct = position.side === 'buy'
       ? (exitPrice - position.entryPrice) / position.entryPrice * 100
       : (position.entryPrice - exitPrice) / position.entryPrice * 100;
@@ -528,10 +535,11 @@ async function bootstrap(): Promise<void> {
   // even during quiet periods when no positions open or close.
   const statePersistInterval = setInterval(() => {
     void stateMutex.run(async () => {
-      // Sync drawdown baseline from RiskManager so it survives restarts
+      // Sync both drawdown baseline and circuit breaker state from RiskManager
       await stateMgr.saveState({
         ...currentState,
-        drawdownBaseline: riskMgr.getDrawdownBaseline(),
+        drawdownBaseline:     riskMgr.getDrawdownBaseline(),
+        circuitBreakerActive: riskMgr.getCircuitBreakerActive(),
       });
     });
   }, cfg.statePersistSec * 1000);
@@ -559,9 +567,11 @@ async function bootstrap(): Promise<void> {
     await stateMutex.run(async () => {
       await stateMgr.saveState({
         ...currentState,
-        openPositions:       currentState.openPositions,
-        pendingTransactions: [],
-        emergencyShutdown:   reason === 'emergency' || reason === 'file-trigger',
+        drawdownBaseline:     riskMgr.getDrawdownBaseline(),
+        circuitBreakerActive: riskMgr.getCircuitBreakerActive(),
+        openPositions:        currentState.openPositions,
+        pendingTransactions:  [],
+        emergencyShutdown:    reason === 'emergency' || reason === 'file-trigger',
       });
     });
 

@@ -107,10 +107,22 @@ export class RiskManager {
     return this.drawdownBaseline;
   }
 
+  getCircuitBreakerActive(): boolean {
+    return this.circuitBreakerActive;
+  }
+
   /** Restore the drawdown baseline from persisted state on agent restart */
   restoreDrawdownBaseline(baseline: number): void {
     if (baseline > 0) {
       this.drawdownBaseline = baseline;
+    }
+  }
+
+  /** Restore the circuit breaker state from persisted state on agent restart */
+  restoreCircuitBreakerState(active: boolean): void {
+    this.circuitBreakerActive = active;
+    if (active) {
+      logger.warn('Circuit breaker restored as ACTIVE from persisted state — trading halted until manually reset');
     }
   }
 

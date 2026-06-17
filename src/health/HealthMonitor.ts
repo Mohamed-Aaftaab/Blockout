@@ -13,6 +13,7 @@ export class HealthMonitor {
   private startTime: number = 0;
   private shutdownTriggered: boolean = false;
   private shutdownPollInterval: NodeJS.Timeout | null = null;
+  private circuitBreakerListener: (() => void) | null = null;
 
   constructor(config: ConfigurationService, bus: EventBus) {
     this.config = config;
@@ -34,10 +35,11 @@ export class HealthMonitor {
     }, cfg.shutdownPollMs);
 
     // Wire circuit state to RiskManager's circuit breaker events
-    this.bus.on('risk:circuit_breaker', () => {
+    this.circuitBreakerListener = () => {
       this.circuitState = 'OPEN';
       logger.warn('Circuit state: OPEN (circuit breaker triggered)');
-    });
+    };
+    this.bus.on('risk:circuit_breaker', this.circuitBreakerListener);
 
     logger.info('HealthMonitor started', { networkMode: cfg.network.mode });
   }
@@ -46,6 +48,10 @@ export class HealthMonitor {
     if (this.shutdownPollInterval !== null) {
       clearInterval(this.shutdownPollInterval);
       this.shutdownPollInterval = null;
+    }
+    if (this.circuitBreakerListener !== null) {
+      this.bus.off('risk:circuit_breaker', this.circuitBreakerListener);
+      this.circuitBreakerListener = null;
     }
     logger.info('HealthMonitor stopped');
   }

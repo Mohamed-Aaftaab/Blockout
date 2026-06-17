@@ -50,7 +50,15 @@ export class AnalyticsEngine {
 
   recordTrade(record: TradeRecord): void {
     this.tradeRecords.push(record);
+    // Cap trade records to prevent unbounded memory growth on long-running deployments
+    if (this.tradeRecords.length > 50_000) {
+      this.tradeRecords = this.tradeRecords.slice(-25_000);
+    }
     this.latencies.push(record.signalToTxMs);
+    // Cap latency array to prevent unbounded memory growth on long-running deployments
+    if (this.latencies.length > 10_000) {
+      this.latencies = this.latencies.slice(-5_000);
+    }
 
     const tx = record.transactions[0];
     logger.info('Trade recorded', {
