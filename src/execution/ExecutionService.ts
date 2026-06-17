@@ -64,7 +64,20 @@ export class ExecutionService {
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        // Build full swap plan including any required ERC-20 approval
+        // For BSC Perpetuals: use routeOrder directly (no ERC-20 approval needed)
+        if (order.venue === 'bsc_perpetuals') {
+          const txResult = await this.engine.routeOrder({ ...order, slippage });
+          if (!txResult.ok) throw new Error(txResult.error.message);
+          const perpTx = txResult.value;
+          const txHash = await this.sendRawTx(perpTx.to, perpTx.calldata, perpTx.value, gasPrice, perpTx.gasLimit);
+          this.bus.emit('execution:submitted', { txHash, orderId: order.id, gasPrice });
+          logger.info('Perp position submitted', { txHash, orderId: order.id, gasPrice });
+          const confirmed = await this.awaitConfirmation(txHash, cfg.txTimeoutSec * 1000);
+          if (!confirmed.ok) return confirmed;
+          return ok({ ...confirmed.value, orderId: order.id, gasPrice });
+        }
+
+        // For PancakeSwap: build full swap plan including any required ERC-20 approval
         const plan = await this.engine.buildSwapPlan({ ...order, slippage });
 
         // Step 1: Send ERC-20 approval if needed (before the swap)
@@ -116,6 +129,19 @@ export class ExecutionService {
   async executeChunk(chunk: Order, gasPrice: number): Promise<Result<Transaction, ExecutionError>> {
     try {
       const actualGasPrice = gasPrice > 0 ? gasPrice : await this.gasOptimizer.getOptimalGasPrice();
+
+      // TWAP chunks are always PancakeSwap — perp orders are never split
+      // But guard defensively in case venue is unexpected
+      if (chunk.venue === 'bsc_perpetuals') {
+        const txResult = await this.engine.routeOrder(chunk);
+        if (!txResult.ok) throw new Error(txResult.error.message);
+        const perpTx = txResult.value;
+        const txHash = await this.sendRawTx(perpTx.to, perpTx.calldata, perpTx.value, actualGasPrice, perpTx.gasLimit);
+        const confirmed = await this.awaitConfirmation(txHash, 120_000);
+        if (!confirmed.ok) return confirmed;
+        return ok({ ...confirmed.value, orderId: chunk.id, gasPrice: actualGasPrice });
+      }
+
       const plan = await this.engine.buildSwapPlan(chunk);
 
       // Send approval if needed

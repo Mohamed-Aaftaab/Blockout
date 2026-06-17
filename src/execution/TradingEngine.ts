@@ -241,7 +241,8 @@ export class TradingEngine {
       } else {
         // Buying CAKE/ETH/BTC with BNB — convert USD→BNB, spend native BNB
         const bnbAmount  = order.size / this.bnbPriceUsd;
-        spendAmountWei   = ethers.parseUnits(bnbAmount.toFixed(18).slice(0, 20), 18);
+        // Use 8 decimal places — sufficient precision without float representation issues
+        spendAmountWei   = ethers.parseUnits(bnbAmount.toFixed(8), 18);
         path             = [wbnb, baseToken];
         const outMin     = await getAmountOutMin(spendAmountWei, path);
         calldata         = iface.encodeFunctionData('swapExactETHForTokens', [outMin, path, recipient, deadline]);
@@ -253,7 +254,7 @@ export class TradingEngine {
       if (baseIsNative) {
         // Selling BNB for USDT — convert USD→BNB, spend native BNB
         const bnbAmount  = order.size / this.bnbPriceUsd;
-        spendAmountWei   = ethers.parseUnits(bnbAmount.toFixed(18).slice(0, 20), 18);
+        spendAmountWei   = ethers.parseUnits(bnbAmount.toFixed(8), 18);
         path             = [wbnb, quoteToken];
         const outMin     = await getAmountOutMin(spendAmountWei, path);
         calldata         = iface.encodeFunctionData('swapExactETHForTokens', [outMin, path, recipient, deadline]);
@@ -264,10 +265,10 @@ export class TradingEngine {
         // Convert USD→token using estimated token price from pool
         const baseTokenDecimals  = getTokenDecimals(baseSymbol ?? 'CAKE');
         // Get token price in BNB then USD using V2 pool reserves
-        const tokenPriceInBnb = await this.getTokenPriceInBnb(baseToken, quoteToken, wbnb, provider, v2Factory);
+        const tokenPriceInBnb = await this.getTokenPriceInBnb(baseToken, wbnb, provider, v2Factory);
         const tokenPriceUsd   = tokenPriceInBnb * this.bnbPriceUsd;
         const tokenAmount     = tokenPriceUsd > 0 ? order.size / tokenPriceUsd : order.size; // fallback: treat as raw token
-        spendAmountWei        = ethers.parseUnits(tokenAmount.toFixed(18).slice(0, 20), baseTokenDecimals);
+        spendAmountWei        = ethers.parseUnits(tokenAmount.toFixed(8), baseTokenDecimals);
         path                  = [baseToken, wbnb];
         const outMin          = await getAmountOutMin(spendAmountWei, path);
         calldata              = iface.encodeFunctionData('swapExactTokensForETH', [spendAmountWei, outMin, path, recipient, deadline]);
@@ -325,11 +326,10 @@ export class TradingEngine {
 
   /** Helper: get approximate token price in BNB via pool reserves */
   private async getTokenPriceInBnb(
-    tokenAddress: string,
-    quoteAddress:  string,
-    wbnb:          string,
-    provider:      ethers.JsonRpcProvider,
-    factoryAddress:string,
+    tokenAddress:   string,
+    wbnb:           string,
+    provider:       ethers.JsonRpcProvider,
+    factoryAddress: string,
   ): Promise<number> {
     try {
       // Try direct token/WBNB pool first
@@ -359,7 +359,7 @@ export class TradingEngine {
   private async buildPerpPosition(order: Order): Promise<Transaction> {
     const cfg      = this.config.get();
     const isLong   = order.side === 'buy';
-    const sizeWei  = ethers.parseUnits((order.size / this.bnbPriceUsd).toFixed(18).slice(0, 20), 18);
+    const sizeWei  = ethers.parseUnits((order.size / this.bnbPriceUsd).toFixed(8), 18);
     const leverage = cfg.risk.leverageMultiplier;
     const slipBps  = Math.floor(order.slippage * 100);
     const iface    = new ethers.Interface([
