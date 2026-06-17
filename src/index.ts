@@ -19,7 +19,7 @@ import { StateManager }              from './state/StateManager';
 import { AnalyticsEngine }           from './analytics/AnalyticsEngine';
 import { HealthMonitor }             from './health/HealthMonitor';
 import type {
-  TradingSignal, Order, Position, Transaction, TradeRecord,
+  TradingSignal, Order, Position, Transaction, TradeRecord, SystemState,
 } from './types/index';
 import { uuid } from './utils/uuid';
 
@@ -29,15 +29,13 @@ const logger = createLogger({
   transports: [new transports.Console()],
 });
 
-// ─── Bootstrap ───────────────────────────────────────────────────────────────
-
 async function bootstrap(): Promise<void> {
 
-  // ── [1] Load and validate configuration ───────────────────────────────────
+  // ── [1] Configuration ─────────────────────────────────────────────────────
   const configSvc = new ConfigurationService();
   const cfgResult = configSvc.load();
   if (!cfgResult.ok) {
-    logger.error('Configuration failed — fix .env before starting', { error: cfgResult.error.message });
+    logger.error('Configuration failed — fix .env', { error: cfgResult.error.message });
     process.exit(1);
   }
   const cfg = configSvc.get();
@@ -48,7 +46,8 @@ async function bootstrap(): Promise<void> {
   // ── [3] State ─────────────────────────────────────────────────────────────
   const stateMgr    = new StateManager(configSvc, bus);
   const stateResult = await stateMgr.loadState();
-  const state       = stateResult.ok ? stateResult.value : stateMgr.emptyState();
+  // Use a mutable reference so state updates are reflected everywhere
+  let currentState: SystemState = stateResult.ok ? stateResult.value : stateMgr.emptyState();
 
   // ── [4] Parallel SDK init ─────────────────────────────────────────────────
   const tradingEngine = new TradingEngine(configSvc, bus);
@@ -67,26 +66,25 @@ async function bootstrap(): Promise<void> {
   health.start();
 
   // ── [6] Supporting services ───────────────────────────────────────────────
-  const analytics   = new AnalyticsEngine(stateMgr, configSvc, bus);
-  const regimeDet   = new RegimeDetector(marketData, configSvc, bus);
-  const poolAnalyzer= new PoolAnalyzer(tradingEngine, configSvc, bus);
-  const riskMgr     = new RiskManager(tradingEngine, configSvc, bus);
-  const mevModule   = new MEVDefenseModule(configSvc, bus);
-  const signalGen   = new SignalGenerator(marketData, configSvc, bus);
+  const analytics    = new AnalyticsEngine(stateMgr, configSvc, bus);
+  const regimeDet    = new RegimeDetector(marketData, configSvc, bus);
+  const poolAnalyzer = new PoolAnalyzer(tradingEngine, configSvc, bus);
+  const riskMgr      = new RiskManager(tradingEngine, configSvc, bus);
+  const mevModule    = new MEVDefenseModule(configSvc, bus);
+  const signalGen    = new SignalGenerator(marketData, configSvc, bus);
 
   analytics.start();
   regimeDet.start();
   await riskMgr.start();
 
   // ── [7] Recover open positions from persisted state ───────────────────────
-  for (const position of state.openPositions) {
+  for (const position of currentState.openPositions) {
     riskMgr.onPositionOpened(position);
     logger.info('Recovered open position', { id: position.id, pair: position.pair });
   }
 
-  // ── [8] Strategy manager ──────────────────────────────────────────────────
-  const stratMgr = new StrategyManager(signalGen, regimeDet, configSvc, bus);
-
+  // ── [8] Strategies ────────────────────────────────────────────────────────
+  const stratMgr  = new StrategyManager(signalGen, regimeDet, configSvc, bus);
   const midBattle = new MidBattleScalpingStrategy(configSvc, bus);
   const momentum  = new MomentumStrategy(configSvc, bus);
   const meanRev   = new MeanReversionStrategy(configSvc, bus);
@@ -98,37 +96,51 @@ async function bootstrap(): Promise<void> {
   stratMgr.registerStrategy(range);
   stratMgr.start();
 
-  // ── [8b] Wire market:data → SignalGenerator → strategies ─────────────────
-  // This is the missing link: market data arrives → signals generated → strategies act
+  // ── Live position registry (truth source across closures) ─────────────────
+  const openPositionMap = new Map<string, { position: Position; signal: TradingSignal; openedAt: number }>();
+
+  // ── Concurrency guard: one pipeline execution per pair at a time ──────────
+  const pipelineInProgress = new Set<string>();
+
+  // ── [8b] market:data → SignalGenerator pipeline ───────────────────────────
   bus.on('market:data', ({ pair, data }) => {
-    // Keep all strategies' ATH / market state current
+    // Keep strategy market state current (ATH tracking, price cache)
     for (const strategy of stratMgr.getActiveStrategies()) {
       strategy.onMarketData(data);
     }
 
-    // Update regime classification for this pair's data
+    // Detect regime BEFORE computing composite signal, so regime is available synchronously
     const regime = regimeDet.detectRegime(pair, data);
 
-    // Generate signals from the latest market data
+    // Generate component signals
     const signals = signalGen.generateSignals(pair, data);
+    if (signals.length === 0) return;
 
-    // Only produce a composite signal if there is at least one component signal
-    if (signals.length > 0) {
-      // computeCompositeSignal internally emits 'signal:generated' on the bus
-      // which StrategyManager listens to and routes to strategies
-      const composite = signalGen.computeCompositeSignal(signals);
-      // Attach the detected regime to the composite so strategies see it
-      composite.regime = regime;
+    // Attach the current regime to every signal before emitting composite
+    for (const s of signals) {
+      s.regime = regime;
     }
+
+    // computeCompositeSignal emits 'signal:generated' synchronously on the bus.
+    // StrategyManager receives it in the same tick, so regime is already correct.
+    const composite = signalGen.computeCompositeSignal(signals);
+    composite.regime = regime; // ensure composite also carries correct regime
   });
 
-  // ── [8c] Wire strategy:signal → Pool check → Risk check → MEV → Execute ──
-  // This is the order execution pipeline
+  // ── [8c] strategy:signal → execution pipeline ────────────────────────────
   bus.on('strategy:signal', ({ signal }) => {
-    void executeSignalPipeline(signal);
+    // Skip if already processing this pair — prevents duplicate positions
+    if (pipelineInProgress.has(signal.pair)) {
+      logger.debug('Pipeline already in progress for pair, skipping duplicate signal', { pair: signal.pair });
+      return;
+    }
+    pipelineInProgress.add(signal.pair);
+    void executeSignalPipeline(signal).finally(() => {
+      pipelineInProgress.delete(signal.pair);
+    });
   });
 
-  // ── [8d] Wire SL/TP triggers → close positions ────────────────────────────
+  // ── [8d] SL/TP triggers → position close ─────────────────────────────────
   bus.on('risk:sl_triggered', ({ positionId, price }) => {
     void handlePositionClose(positionId, price, 'stop_loss');
   });
@@ -136,28 +148,24 @@ async function bootstrap(): Promise<void> {
     void handlePositionClose(positionId, price, 'take_profit');
   });
 
-  // Open position registry for the lifecycle handler
-  const openPositionMap = new Map<string, { position: Position; signal: TradingSignal; openedAt: number }>();
-
+  // ─────────────────────────────────────────────────────────────────────────
+  // Full order execution pipeline
+  // ─────────────────────────────────────────────────────────────────────────
   async function executeSignalPipeline(signal: TradingSignal): Promise<void> {
+    const signalTimestamp = Date.now();
     try {
-      const signalTimestamp = Date.now();
-
-      // Step 1: Pool health check
+      // 1. Pool health check
       const poolHealth = await poolAnalyzer.analyzePool(signal.pair);
       if (!poolHealth.healthy) {
-        logger.warn('Signal rejected: pool health check failed', {
-          pair:   signal.pair,
-          reason: poolHealth.rejectionReason,
-        });
+        logger.warn('Signal rejected: unhealthy pool', { pair: signal.pair, reason: poolHealth.rejectionReason });
         return;
       }
 
-      // Step 2: Get portfolio value and build order
+      // 2. Get real portfolio value via wallet balance
       const portfolioUsd = await executionSvc.getPortfolioUsd();
       const posResult    = riskMgr.calculatePositionSize(portfolioUsd, signal.pair);
       if (!posResult.ok) {
-        logger.warn('Signal rejected: position size calculation failed', { error: posResult.error.message });
+        logger.warn('Signal rejected: position sizing failed', { error: posResult.error.message, portfolioUsd });
         return;
       }
 
@@ -174,7 +182,7 @@ async function bootstrap(): Promise<void> {
         signalId:  signal.id,
       };
 
-      // Step 3: Risk validation
+      // 3. Risk validation (checks circuit breaker + exposure limits)
       const validatedResult = await riskMgr.validateNewPosition(order, []);
       if (!validatedResult.ok) {
         logger.warn('Signal rejected: risk validation failed', { error: validatedResult.error.message });
@@ -182,10 +190,11 @@ async function bootstrap(): Promise<void> {
       }
       const validOrder = validatedResult.value;
 
-      // Step 4: MEV Defense — split large orders via Anaconda Squeeze TWAP
+      // 4. MEV Defense — Anaconda Squeeze for large orders, direct for small
       let txResults: Transaction[];
+
       if (mevModule.shouldSplit(validOrder)) {
-        logger.info('Order above TWAP threshold — executing Anaconda Squeeze', {
+        logger.info('Anaconda Squeeze activated', {
           orderId: validOrder.id,
           size:    validOrder.size,
           chunks:  cfg.twap.chunkCount,
@@ -194,14 +203,12 @@ async function bootstrap(): Promise<void> {
         txResults = await mevModule.executeTwap(
           validOrder,
           twapPlan,
-          (chunk) => executionSvc.executeChunk(chunk, 0)
-            .then(r => {
-              if (!r.ok) throw r.error;
-              return r.value;
-            }),
+          (chunk) => executionSvc.executeChunk(chunk, 0).then(r => {
+            if (!r.ok) throw r.error;
+            return r.value;
+          }),
         );
       } else {
-        // Step 5: Direct execution
         const execResult = await executionSvc.executeOrder(validOrder);
         if (!execResult.ok) {
           logger.error('Order execution failed', { error: execResult.error.message, orderId: validOrder.id });
@@ -210,9 +217,19 @@ async function bootstrap(): Promise<void> {
         txResults = [execResult.value];
       }
 
-      // Step 6: Record the open position
+      // 5. Record the open position
       const firstTx    = txResults[0];
       const entryPrice = await tradingEngine.getCurrentPrice(signal.pair);
+
+      // SL/TP directions are correct for both buy and sell:
+      // Buy:  SL below entry, TP above entry
+      // Sell: SL above entry, TP below entry
+      const stopLoss   = signal.side === 'buy'
+        ? entryPrice * (1 - cfg.risk.stopLossPct  / 100)
+        : entryPrice * (1 + cfg.risk.stopLossPct  / 100);
+      const takeProfit = signal.side === 'buy'
+        ? entryPrice * (1 + cfg.risk.takeProfitPct / 100)
+        : entryPrice * (1 - cfg.risk.takeProfitPct / 100);
 
       const position: Position = {
         id:         validOrder.id,
@@ -220,12 +237,8 @@ async function bootstrap(): Promise<void> {
         side:       signal.side,
         entryPrice,
         size:       validOrder.size,
-        stopLoss:   signal.side === 'buy'
-          ? entryPrice * (1 - cfg.risk.stopLossPct / 100)
-          : entryPrice * (1 + cfg.risk.stopLossPct / 100),
-        takeProfit: signal.side === 'buy'
-          ? entryPrice * (1 + cfg.risk.takeProfitPct / 100)
-          : entryPrice * (1 - cfg.risk.takeProfitPct / 100),
+        stopLoss,
+        takeProfit,
         leverage:   1,
         strategy:   signal.strategy,
         venue:      validOrder.venue,
@@ -236,21 +249,21 @@ async function bootstrap(): Promise<void> {
       riskMgr.onPositionOpened(position);
       openPositionMap.set(position.id, { position, signal, openedAt: signalTimestamp });
 
-      // Persist updated state
-      await stateMgr.saveState({
-        ...state,
-        openPositions: [...state.openPositions, position],
-      });
+      // Update the live state snapshot (not the stale startup snapshot)
+      currentState = {
+        ...currentState,
+        openPositions: [...currentState.openPositions, position],
+      };
+      await stateMgr.saveState(currentState);
 
-      // Track signal-to-tx latency
       const latencyMs = (firstTx?.submittedAt ?? Date.now()) - signalTimestamp;
       logger.info('Position opened', {
         id:        position.id,
         pair:      signal.pair,
         side:      signal.side,
         entry:     entryPrice,
-        sl:        position.stopLoss.toFixed(4),
-        tp:        position.takeProfit.toFixed(4),
+        sl:        stopLoss.toFixed(4),
+        tp:        takeProfit.toFixed(4),
         latencyMs,
       });
 
@@ -263,6 +276,9 @@ async function bootstrap(): Promise<void> {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Position close handler (SL or TP triggered)
+  // ─────────────────────────────────────────────────────────────────────────
   async function handlePositionClose(
     positionId: string,
     exitPrice:  number,
@@ -275,7 +291,7 @@ async function bootstrap(): Promise<void> {
     openPositionMap.delete(positionId);
     riskMgr.onPositionClosed(positionId);
 
-    // Execute the closing order
+    // Execute closing order (reverse of open)
     const closeOrder: Order = {
       id:        uuid(),
       pair:      position.pair,
@@ -290,9 +306,9 @@ async function bootstrap(): Promise<void> {
     };
 
     const execResult = await executionSvc.executeOrder(closeOrder);
-    const closeTx    = execResult.ok ? [execResult.value] : [];
+    const closeTxs   = execResult.ok ? [execResult.value] : [];
 
-    // Calculate PnL
+    // PnL calculation — correct for both long (buy) and short (sell)
     const pnlUsd = position.side === 'buy'
       ? (exitPrice - position.entryPrice) / position.entryPrice * position.size
       : (position.entryPrice - exitPrice) / position.entryPrice * position.size;
@@ -309,8 +325,8 @@ async function bootstrap(): Promise<void> {
       pnlUsd,
       pnlPct,
       holdMs:       Date.now() - openedAt,
-      transactions: closeTx,
-      signalToTxMs: closeTx[0] ? closeTx[0].submittedAt - openedAt : 0,
+      transactions: closeTxs,
+      signalToTxMs: closeTxs[0] ? closeTxs[0].submittedAt - openedAt : 0,
     };
 
     analytics.recordTrade(tradeRecord);
@@ -325,22 +341,23 @@ async function bootstrap(): Promise<void> {
       pnlPct: pnlPct.toFixed(2),
     });
 
-    // Update persisted state
-    await stateMgr.saveState({
-      ...state,
-      openPositions: state.openPositions.filter(p => p.id !== positionId),
-    });
+    // Update live state (remove closed position)
+    currentState = {
+      ...currentState,
+      openPositions: currentState.openPositions.filter(p => p.id !== positionId),
+    };
+    await stateMgr.saveState(currentState);
   }
 
-  // ── [9] Log network mode ──────────────────────────────────────────────────
+  // ── [9] Banner ────────────────────────────────────────────────────────────
   logger.info('══════════════════════════════════════════════════════════');
   logger.info(`  BLOCKOUT — NETWORK: ${cfg.network.mode.toUpperCase()}`);
-  logger.info(`  Wallet: ${executionSvc.getWalletAddress()}`);
+  logger.info(`  Wallet:  ${executionSvc.getWalletAddress()}`);
+  logger.info(`  Pairs:   ${cfg.tradingPairs.join(', ')}`);
   logger.info('══════════════════════════════════════════════════════════');
 
   // ── [10] System READY ─────────────────────────────────────────────────────
   logger.info('System READY — Blockout is live', {
-    pairs:      cfg.tradingPairs,
     strategies: stratMgr.getActiveStrategies().map(s => s.name),
     network:    cfg.network.mode,
     wallet:     executionSvc.getWalletAddress(),
@@ -352,13 +369,9 @@ async function bootstrap(): Promise<void> {
   const shutdown = async (reason: string): Promise<void> => {
     if (shutdownInProgress) return;
     shutdownInProgress = true;
-
     logger.info('Shutting down Blockout...', { reason });
 
-    // Stop accepting new signals first
     stratMgr.stop();
-
-    // Stop all timers
     riskMgr.stop();
     analytics.stop();
     regimeDet.stop();
@@ -366,14 +379,12 @@ async function bootstrap(): Promise<void> {
     health.stop();
     tradingEngine.stop();
 
-    // Generate final report
-    const finalReport = analytics.generateReport('shutdown');
-    logger.info(finalReport);
+    logger.info(analytics.generateReport('shutdown'));
 
-    // Persist final state
+    // Persist the current live state (not the stale startup snapshot)
     await stateMgr.saveState({
-      ...state,
-      openPositions:       [],
+      ...currentState,
+      openPositions:       currentState.openPositions,
       pendingTransactions: [],
       emergencyShutdown:   reason === 'emergency' || reason === 'file-trigger',
     });

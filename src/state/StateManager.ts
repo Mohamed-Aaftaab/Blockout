@@ -44,7 +44,10 @@ const TransactionSchema: z.ZodType<Transaction> = z.object({
   confirmedAt:    z.number().nullable(),
   blockNumber:    z.number().nullable(),
   error:          z.string().nullable(),
-});
+  calldata:       z.string(),
+  value:          z.bigint(),
+  to:             z.string(),
+}) as z.ZodType<Transaction>;
 
 const SystemStateSchema: z.ZodType<SystemState> = z.object({
   version:              z.string(),

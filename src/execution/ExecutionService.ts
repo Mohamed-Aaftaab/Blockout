@@ -41,19 +41,13 @@ export class ExecutionService {
   async initialize(): Promise<void> {
     const cfg = this.config.get();
     try {
-      // Load or create a persistent wallet key
-      // In production this is replaced by TWAK AgentKit HMAC signing
-      // For hackathon: use a persistent local key so wallet address is stable across restarts
       const wallet = await this.loadOrCreateWallet();
       this.wallet  = wallet;
-
-      // Wire the signer into TradingEngine so it can estimate gas and sign txs
       this.engine.setSigner(wallet);
-
       logger.info('ExecutionService initialized', {
         address: wallet.address,
         network: cfg.network.mode,
-        mode:    'self-custody (ethers wallet)',
+        mode:    'self-custody (persistent ethers wallet)',
       });
     } catch (e) {
       const msg = `ExecutionService initialization failed: ${String(e)}`;
@@ -70,13 +64,16 @@ export class ExecutionService {
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
+        // Build the transaction (generates real calldata)
         const txResult = await this.engine.routeOrder({ ...order, slippage });
         if (!txResult.ok) throw new Error(txResult.error.message);
 
-        const signedHash = await this.signAndBroadcast(txResult.value, order, gasPrice);
+        // Sign and broadcast using the calldata from TradingEngine
+        const signedHash = await this.signAndBroadcast(txResult.value, gasPrice);
         this.bus.emit('execution:submitted', { txHash: signedHash, orderId: order.id, gasPrice });
         logger.info('Transaction submitted', { txHash: signedHash, orderId: order.id, venue: order.venue, gasPrice });
 
+        // Wait for on-chain confirmation
         const confirmed = await this.awaitConfirmation(signedHash, cfg.txTimeoutSec * 1000);
         if (!confirmed.ok) return confirmed;
 
@@ -84,7 +81,7 @@ export class ExecutionService {
       } catch (e) {
         const errMsg = String(e);
         if (attempt < maxRetries) {
-          if (errMsg.includes('gas') || errMsg.includes('underpriced') || errMsg.includes('insufficient')) {
+          if (errMsg.includes('gas') || errMsg.includes('underpriced') || errMsg.includes('insufficient funds')) {
             gasPrice = Math.min(gasPrice * (1 + cfg.gas.gasBumpPct / 100), cfg.gas.maxGasGwei);
             logger.info('Retrying with higher gas', { attempt: attempt + 1, gasPrice });
             continue;
@@ -95,7 +92,6 @@ export class ExecutionService {
             continue;
           }
         }
-        // Non-retryable or exhausted
         const execErr = new ExecutionError(errMsg, order.id, 'unknown');
         this.bus.emit('execution:failed', { orderId: order.id, error: errMsg, attempt });
         return err(execErr);
@@ -111,10 +107,11 @@ export class ExecutionService {
     try {
       const txResult = await this.engine.routeOrder(chunk);
       if (!txResult.ok) throw new Error(txResult.error.message);
-      const signedHash = await this.signAndBroadcast(txResult.value, chunk, gasPrice);
+      const actualGasPrice = gasPrice > 0 ? gasPrice : await this.gasOptimizer.getOptimalGasPrice();
+      const signedHash = await this.signAndBroadcast(txResult.value, actualGasPrice);
       const confirmed  = await this.awaitConfirmation(signedHash, 120_000);
       if (!confirmed.ok) return confirmed;
-      return ok({ ...confirmed.value, orderId: chunk.id, gasPrice });
+      return ok({ ...confirmed.value, orderId: chunk.id, gasPrice: actualGasPrice });
     } catch (e) {
       return err(new ExecutionError(String(e), chunk.id, 'unknown'));
     }
@@ -129,14 +126,14 @@ export class ExecutionService {
       await sleep(pollMs);
 
       try {
-        if (provider) {
+        if (provider !== null) {
           const receipt = await provider.getTransactionReceipt(txHash);
           if (receipt !== null && receipt.status !== undefined) {
             if (receipt.status === 0) {
-              // Transaction reverted on-chain
               return err(new ExecutionError(`Transaction ${txHash} reverted on-chain`, '', 'rpc'));
             }
-            const actualSlippage = 0.1; // In production: calculate from receipt logs
+            // Calculate actual slippage from receipt in production; use estimate for now
+            const actualSlippage = 0.1;
             const tx: Transaction = {
               hash:           txHash,
               orderId:        '',
@@ -149,23 +146,36 @@ export class ExecutionService {
               confirmedAt:    Date.now(),
               blockNumber:    receipt.blockNumber,
               error:          null,
+              calldata:       '0x',
+              value:          0n,
+              to:             '',
             };
             this.bus.emit('execution:confirmed', { tx });
             return ok(tx);
           }
         } else {
-          // Demo/testnet mode without provider — simulate confirmation
+          // Demo mode: simulate confirmation (no actual provider available)
           const tx: Transaction = {
-            hash: txHash, orderId: '', status: 'confirmed',
-            gasPrice: 0, gasLimit: 300_000, gasUsed: 150_000,
-            actualSlippage: 0.1, submittedAt: start,
-            confirmedAt: Date.now(), blockNumber: null, error: null,
+            hash:           txHash,
+            orderId:        '',
+            status:         'confirmed',
+            gasPrice:       0,
+            gasLimit:       300_000,
+            gasUsed:        150_000,
+            actualSlippage: 0.1,
+            submittedAt:    start,
+            confirmedAt:    Date.now(),
+            blockNumber:    null,
+            error:          null,
+            calldata:       '0x',
+            value:          0n,
+            to:             '',
           };
           this.bus.emit('execution:confirmed', { tx });
           return ok(tx);
         }
       } catch {
-        // Poll error — keep waiting
+        // Transient poll error — keep retrying until timeout
       }
     }
 
@@ -181,33 +191,26 @@ export class ExecutionService {
     return this.engine.getPortfolioValue(this.wallet.address);
   }
 
-  private async signAndBroadcast(
-    tx: Transaction,
-    order: Order,
-    gasPrice: number,
-  ): Promise<string> {
+  // Signs and broadcasts the transaction using real calldata from TradingEngine
+  private async signAndBroadcast(tx: Transaction, gasPrice: number): Promise<string> {
     if (!this.wallet) throw new Error('Wallet not initialized');
 
-    const cfg      = this.config.get();
     const provider = (this.engine as unknown as { provider: ethers.JsonRpcProvider }).provider;
-
     if (!provider) throw new Error('Provider not initialized');
 
-    const signer   = this.wallet.connect(provider);
-    const nonce    = await signer.getNonce();
+    const signer      = this.wallet.connect(provider);
     const gasPriceWei = ethers.parseUnits(gasPrice.toFixed(9), 'gwei');
-    const amountInWei = ethers.parseUnits(order.size.toFixed(6), 18);
 
-    const signedTx = await signer.sendTransaction({
-      to:       cfg.venue.pancakeswapRouter,
-      value:    order.side === 'buy' ? amountInWei : 0n,
+    // Use the real calldata and value built by TradingEngine
+    const sentTx = await signer.sendTransaction({
+      to:       tx.to,
+      data:     tx.calldata,  // ← real swap calldata, not '0x'
+      value:    tx.value,     // ← real BNB value for native swaps
       gasPrice: gasPriceWei,
       gasLimit: tx.gasLimit,
-      nonce,
-      data:     '0x', // In production: pass calldata from buildPancakeSwapTx
     });
 
-    return signedTx.hash;
+    return sentTx.hash;
   }
 
   private async loadOrCreateWallet(): Promise<ethers.Wallet> {
@@ -221,15 +224,14 @@ export class ExecutionService {
       return wallet;
     }
 
-    // Create new wallet and persist the private key
     // createRandom() returns HDNodeWallet; extract a plain Wallet via the private key
     const hdWallet = ethers.Wallet.createRandom();
     const wallet   = new ethers.Wallet(hdWallet.privateKey);
     await fs.promises.writeFile(WALLET_KEY_FILE, wallet.privateKey, { mode: 0o600 });
     logger.info('Created new wallet', { address: wallet.address });
-    logger.warn('⚠️  NEW WALLET CREATED — fund this address with testnet BNB before trading:', {
+    logger.warn('⚠️  NEW WALLET — fund this address with testnet BNB before live trading:', {
       address: wallet.address,
-      faucet: 'https://testnet.bnbchain.org/faucet-smart',
+      faucet:  'https://testnet.bnbchain.org/faucet-smart',
     });
     return wallet;
   }

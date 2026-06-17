@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit"
   },
   "_comments": {
-    "hackathon-sdks": "Install manually when available: @trustwallet/agent-sdk and @bnb-chain/bnbagent-sdk are not yet published to npm (hackathon SDKs). Add them once released."
+    "hackathon-sdks": "@trustwallet/agent-sdk and @bnb-chain/bnbagent-sdk are hackathon SDKs. The agent uses ethers.js v6 for equivalent self-custody signing (TradingEngine + ExecutionService). When these packages are published, replace the ethers wallet logic with TWAK AgentKit calls.",
+    "twak-note": "TWAK_ACCESS_ID and TWAK_HMAC_SECRET are pre-loaded in config for TWAK integration readiness. Currently the agent uses a persistent ethers.Wallet stored in data/wallet.key for equivalent self-custody functionality."
   },
   "dependencies": {
     "zod": "^3.22.4",

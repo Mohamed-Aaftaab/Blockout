@@ -241,7 +241,9 @@ export interface Order {
   signalId:  string;
 }
 
-// ─── Transactions ────────────────────────────────────────────────────────────
+// ─── Transactions ─────────────────────────────────────────────────────────────
+// calldata is included so ExecutionService can sign the exact swap calldata
+// built by TradingEngine without rebuilding it
 
 export interface Transaction {
   hash:           string;
@@ -255,6 +257,12 @@ export interface Transaction {
   confirmedAt:    number | null;
   blockNumber:    number | null;
   error:          string | null;
+  // Swap calldata for signing — populated by TradingEngine, consumed by ExecutionService
+  calldata:       string;
+  // Value to send with the transaction (BNB amount for buy swaps)
+  value:          bigint;
+  // Destination contract address
+  to:             string;
 }
 
 // ─── Trade Records ───────────────────────────────────────────────────────────

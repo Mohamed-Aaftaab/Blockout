@@ -27,19 +27,7 @@ const PANCAKE_PAIR_ABI = [
   'function token1() external view returns (address)',
 ];
 
-const ERC20_ABI = [
-  'function decimals() external view returns (uint8)',
-  'function symbol() external view returns (string)',
-  'function balanceOf(address owner) external view returns (uint256)',
-];
-
-const BSC_PERPS_ABI = [
-  'function openPosition(address market, bool isLong, uint256 size, uint256 leverage, uint256 slippage) external payable',
-  'function closePosition(address market, uint256 positionId) external',
-];
-
 // ─── Well-known BSC token addresses ──────────────────────────────────────────
-// Mainnet addresses; testnet uses different values but structure is identical
 const TOKEN_ADDRESSES: Record<string, Record<string, string>> = {
   mainnet: {
     WBNB: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
@@ -113,7 +101,6 @@ export class TradingEngine {
     }
   }
 
-  // Called by ExecutionService to provide the signer after wallet init
   setSigner(wallet: ethers.Wallet): void {
     this.wallet = wallet.connect(this.requireProvider());
     logger.info('TradingEngine signer set', { address: wallet.address });
@@ -135,52 +122,96 @@ export class TradingEngine {
   private async buildPancakeSwapTx(order: Order): Promise<Transaction> {
     const cfg      = this.config.get();
     const provider = this.requireProvider();
-    const router   = new ethers.Contract(cfg.venue.pancakeswapRouter, PANCAKE_ROUTER_ABI, provider);
     const network  = cfg.network.mode === 'mainnet' ? 'mainnet' : 'testnet';
     const tokens   = TOKEN_ADDRESSES[network] ?? TOKEN_ADDRESSES['testnet']!;
 
-    // Resolve token addresses from pair symbol
-    const [baseSymbol, quoteSymbol] = order.pair.split('/');
-    const wbnb  = tokens['WBNB'] ?? ethers.ZeroAddress;
-    const tokenA = tokens[baseSymbol  ?? 'WBNB'] ?? wbnb;
-    const tokenB = tokens[quoteSymbol ?? 'USDT'] ?? (tokens['USDT'] ?? ethers.ZeroAddress);
+    // Resolve token addresses correctly from pair
+    // For BNB/USDT: baseSymbol=BNB, quoteSymbol=USDT
+    // Buy BNB/USDT means: spend USDT (quote), receive BNB (base)
+    // But on DEX with WBNB: buy side = spend WBNB to get the other token, OR buy = receive base
+    // Standard interpretation: buy BNB/USDT = you want BNB, you pay USDT
+    // Path for buy: [WBNB, quoteToken] — spend wrapped BNB to get quote token
+    // Wait — actually "BNB/USDT buy" in trading means: buy BNB with USDT
+    // On PancakeSwap: swapExactTokensForETH path = [USDT, WBNB] to get BNB
+    //                 swapExactETHForTokens path = [WBNB, CAKE] to buy CAKE with BNB
+    // For pair BNB/USDT buy: you're buying the BASE (BNB) with your USDT
+    // path = [USDT, WBNB] — use swapExactTokensForETH
 
-    // Build correct swap path
-    const path: string[] = order.side === 'buy'
-      ? [wbnb, tokenA]   // buy: spend BNB to get token
-      : [tokenA, wbnb];  // sell: spend token to get BNB
+    const [baseSymbol, quoteSymbol] = order.pair.split('/');
+    const wbnb       = tokens['WBNB'] ?? ethers.ZeroAddress;
+    const baseToken  = tokens[baseSymbol  ?? 'BNB']  ?? wbnb;
+    const quoteToken = tokens[quoteSymbol ?? 'USDT'] ?? (tokens['USDT'] ?? ethers.ZeroAddress);
+
+    // buy = acquire base token by spending quote token
+    // sell = sell base token to receive quote token
+    // If base is BNB (WBNB): buy uses swapExactTokensForETH [quoteToken, WBNB]
+    //                         sell uses swapExactETHForTokens [WBNB, quoteToken]
+    const baseIsNative = baseToken.toLowerCase() === wbnb.toLowerCase();
 
     const deadline    = Math.floor(Date.now() / 1000) + 300;
     const slippageBps = Math.floor(order.slippage * 100);
-    const amountInWei = ethers.parseUnits(order.size.toFixed(6), 18);
-    const amountOutMin = (amountInWei * BigInt(10000 - slippageBps)) / BigInt(10000);
+    const amountWei   = ethers.parseUnits(order.size.toFixed(6), 18);
+    const amountMin   = (amountWei * BigInt(10000 - slippageBps)) / BigInt(10000);
 
-    // Encode calldata
-    const iface    = new ethers.Interface(PANCAKE_ROUTER_ABI);
-    const recipient = this.wallet?.address ?? ethers.ZeroAddress;
+    const iface     = new ethers.Interface(PANCAKE_ROUTER_ABI);
+    const recipient  = this.wallet?.address ?? ethers.ZeroAddress;
 
-    const calldata = order.side === 'buy'
-      ? iface.encodeFunctionData('swapExactETHForTokens', [amountOutMin, path, recipient, deadline])
-      : iface.encodeFunctionData('swapExactTokensForETH', [amountInWei, amountOutMin, path, recipient, deadline]);
+    let calldata: string;
+    let value: bigint;
+    let path: string[];
 
-    // Estimate gas
+    if (order.side === 'buy') {
+      if (baseIsNative) {
+        // Buying BNB with USDT: swapExactTokensForETH([USDT, WBNB], amountIn, amountOutMin)
+        path     = [quoteToken, wbnb];
+        calldata = iface.encodeFunctionData('swapExactTokensForETH', [amountWei, amountMin, path, recipient, deadline]);
+        value    = 0n; // paying with ERC-20, no ETH value
+      } else {
+        // Buying CAKE with BNB: swapExactETHForTokens([WBNB, CAKE], amountOutMin)
+        path     = [wbnb, baseToken];
+        calldata = iface.encodeFunctionData('swapExactETHForTokens', [amountMin, path, recipient, deadline]);
+        value    = amountWei; // paying with BNB
+      }
+    } else {
+      if (baseIsNative) {
+        // Selling BNB for USDT: swapExactETHForTokens([WBNB, USDT], amountOutMin)
+        path     = [wbnb, quoteToken];
+        calldata = iface.encodeFunctionData('swapExactETHForTokens', [amountMin, path, recipient, deadline]);
+        value    = amountWei; // selling BNB
+      } else {
+        // Selling CAKE for BNB: swapExactTokensForETH([CAKE, WBNB], amountIn, amountOutMin)
+        path     = [baseToken, wbnb];
+        calldata = iface.encodeFunctionData('swapExactTokensForETH', [amountWei, amountMin, path, recipient, deadline]);
+        value    = 0n;
+      }
+    }
+
+    // Estimate gas with the real calldata
     let gasLimit = 300_000n;
     try {
       if (this.wallet) {
         const signer = this.wallet.connect(provider);
         gasLimit = await signer.estimateGas({
-          to:    cfg.venue.pancakeswapRouter,
-          data:  calldata,
-          value: order.side === 'buy' ? amountInWei : 0n,
+          to:   cfg.venue.pancakeswapRouter,
+          data: calldata,
+          value,
         });
         gasLimit = (gasLimit * 120n) / 100n; // +20% buffer
       }
     } catch {
-      gasLimit = 300_000n; // fallback
+      gasLimit = 300_000n;
     }
 
+    logger.info('PancakeSwap tx built', {
+      pair:     order.pair,
+      side:     order.side,
+      path,
+      amountWei: amountWei.toString(),
+      gasLimit:  gasLimit.toString(),
+    });
+
     return {
-      hash:           '0x' + '0'.repeat(64), // filled after broadcast
+      hash:           '0x' + '0'.repeat(64),
       orderId:        order.id,
       status:         'pending',
       gasPrice:       0,
@@ -191,11 +222,31 @@ export class TradingEngine {
       confirmedAt:    null,
       blockNumber:    null,
       error:          null,
+      calldata,
+      value,
+      to:             cfg.venue.pancakeswapRouter,
     };
   }
 
   private async buildPerpPosition(order: Order): Promise<Transaction> {
     const cfg = this.config.get();
+    // BSC Perps: open a leveraged long or short position
+    const isLong       = order.side === 'buy';
+    const sizeWei      = ethers.parseUnits(order.size.toFixed(6), 18);
+    const leverage     = cfg.risk.leverageMultiplier;
+    const slippageBps  = Math.floor(order.slippage * 100);
+
+    const iface    = new ethers.Interface([
+      'function openPosition(address market, bool isLong, uint256 size, uint256 leverage, uint256 slippage) external payable',
+    ]);
+    const calldata = iface.encodeFunctionData('openPosition', [
+      cfg.venue.bscPerpsContract,
+      isLong,
+      sizeWei,
+      leverage,
+      slippageBps,
+    ]);
+
     return {
       hash:           '0x' + '0'.repeat(64),
       orderId:        order.id,
@@ -208,6 +259,9 @@ export class TradingEngine {
       confirmedAt:    null,
       blockNumber:    null,
       error:          null,
+      calldata,
+      value:          isLong ? sizeWei : 0n,
+      to:             cfg.venue.bscPerpsContract,
     };
   }
 
@@ -234,7 +288,7 @@ export class TradingEngine {
     const tokenB = tokens[quoteSymbol ?? 'USDT'] ?? (tokens['USDT'] ?? ethers.ZeroAddress);
 
     try {
-      const factory   = new ethers.Contract(cfg.venue.pancakeV3Factory, PANCAKE_FACTORY_ABI, provider);
+      const factory    = new ethers.Contract(cfg.venue.pancakeV3Factory, PANCAKE_FACTORY_ABI, provider);
       const getPairFn  = factory.getFunction('getPair');
       const pairAddr   = await getPairFn(tokenA, tokenB) as string;
 
@@ -242,13 +296,12 @@ export class TradingEngine {
         return {
           reserve0: ethers.parseUnits('100000', 18),
           reserve1: ethers.parseUnits('100000', 6),
-          token0:   tokenA, token1: tokenB,
-          pairAddress: pairAddr,
-          fetchedAt:   Date.now(),
+          token0: tokenA, token1: tokenB,
+          pairAddress: pairAddr, fetchedAt: Date.now(),
         };
       }
 
-      const pairContract = new ethers.Contract(pairAddr, PANCAKE_PAIR_ABI, provider);
+      const pairContract  = new ethers.Contract(pairAddr, PANCAKE_PAIR_ABI, provider);
       const getReservesFn = pairContract.getFunction('getReserves');
       const getToken0Fn   = pairContract.getFunction('token0');
       const getToken1Fn   = pairContract.getFunction('token1');
@@ -258,13 +311,11 @@ export class TradingEngine {
 
       return { reserve0, reserve1, token0, token1, pairAddress: pairAddr, fetchedAt: Date.now() };
     } catch {
-      // Fallback for testnet environments where factory may not respond
       return {
         reserve0: ethers.parseUnits('100000', 18),
         reserve1: ethers.parseUnits('100000', 6),
         token0: tokenA, token1: tokenB,
-        pairAddress: ethers.ZeroAddress,
-        fetchedAt: Date.now(),
+        pairAddress: ethers.ZeroAddress, fetchedAt: Date.now(),
       };
     }
   }
@@ -290,16 +341,10 @@ export class TradingEngine {
       const provider = this.requireProvider();
       const address  = walletAddress ?? this.wallet?.address;
       if (!address) return 0;
-
-      // Get native BNB balance
       const balanceWei = await provider.getBalance(address);
       const bnbBalance = Number(ethers.formatUnits(balanceWei, 18));
-
-      // Get BNB price in USD via pool reserves
-      const bnbPrice = await this.getCurrentPrice('BNB/USDT');
-      const usdValue = bnbBalance * (bnbPrice > 0 ? bnbPrice : 300); // fallback $300 BNB
-
-      return usdValue;
+      const bnbPrice   = await this.getCurrentPrice('BNB/USDT');
+      return bnbBalance * (bnbPrice > 0 ? bnbPrice : 300);
     } catch {
       return 0;
     }

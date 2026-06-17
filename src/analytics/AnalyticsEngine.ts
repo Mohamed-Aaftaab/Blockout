@@ -92,6 +92,8 @@ export class AnalyticsEngine {
     const winning      = trades.filter(t => t.pnlUsd > 0);
     const winRate      = trades.length > 0 ? winning.length / trades.length : 0;
     const avgPnlUsd    = trades.length > 0 ? totalPnlUsd / trades.length : 0;
+    // totalPnlPct = sum of all individual trade pnlPct (compound effect approximation)
+    const totalPnlPct  = trades.reduce((s, t) => s + t.pnlPct, 0);
 
     // Daily returns (group by day)
     const dailyMap = new Map<string, number>();
@@ -151,7 +153,7 @@ export class AnalyticsEngine {
     }
 
     return {
-      totalPnlUsd, totalPnlPct: 0, dailyReturns, sharpeRatio, maxDrawdownPct,
+      totalPnlUsd, totalPnlPct, dailyReturns, sharpeRatio, maxDrawdownPct,
       totalTrades: trades.length, winningTrades: winning.length, winRate, avgPnlUsd,
       avgSlippagePct, recentSlippage: allSlippage.slice(-100),
       latencyAvgMs, latencyMedianMs, latencyP95Ms,

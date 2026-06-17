@@ -22,7 +22,7 @@ const RiskConfigSchema = z.object({
 });
 
 const TwapConfigSchema = z.object({
-  thresholdUsd:  z.number().min(100).default(1000),
+  thresholdUsd:  z.number().min(1).default(50),
   chunkCount:    z.number().int().min(2).max(20).default(10),
   minChunkPct:   z.number().min(0.5).max(1.0).default(0.7),
   maxChunkPct:   z.number().min(1.0).max(2.0).default(1.3),

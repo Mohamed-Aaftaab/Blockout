@@ -138,11 +138,20 @@ export class RiskManager {
     for (const [id, position] of this.openPositions) {
       try {
         const price = await this.engine.getCurrentPrice(position.pair);
-        if (price <= position.stopLoss) {
-          logger.info('Stop-loss triggered', { id, pair: position.pair, price, stopLoss: position.stopLoss });
+        // For buy positions:  SL fires when price drops to/below SL, TP fires when price rises to/above TP
+        // For sell positions: SL fires when price rises to/above SL, TP fires when price drops to/below TP
+        const slTriggered = position.side === 'buy'
+          ? price <= position.stopLoss
+          : price >= position.stopLoss;
+        const tpTriggered = position.side === 'buy'
+          ? price >= position.takeProfit
+          : price <= position.takeProfit;
+
+        if (slTriggered) {
+          logger.info('Stop-loss triggered', { id, pair: position.pair, side: position.side, price, stopLoss: position.stopLoss });
           this.bus.emit('risk:sl_triggered', { positionId: id, price });
-        } else if (price >= position.takeProfit) {
-          logger.info('Take-profit triggered', { id, pair: position.pair, price, takeProfit: position.takeProfit });
+        } else if (tpTriggered) {
+          logger.info('Take-profit triggered', { id, pair: position.pair, side: position.side, price, takeProfit: position.takeProfit });
           this.bus.emit('risk:tp_triggered', { positionId: id, price });
         }
       } catch (e) {
