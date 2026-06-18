@@ -47,17 +47,26 @@ const TransactionSchema: z.ZodType<Transaction> = z.object({
   to:             z.string(),
 }) as z.ZodType<Transaction>;
 
-const SystemStateSchema = z.object({
-  version:              z.string(),
-  openPositions:        z.array(PositionSchema),
-  pendingTransactions:  z.array(TransactionSchema),
-  drawdownBaseline:     z.number(),
-  circuitBreakerActive: z.boolean(),
-  emergencyShutdown:    z.boolean(),
-  lastRegimes:          z.record(z.enum(['bull', 'bear', 'sideways'])).default({}),
-  savedAt:              z.number(),
-  checksum:             z.string(),
+const CompetitionRegistrationSchema = z.object({
+  walletAddress: z.string(),
+  txHash:        z.string(),
+  timestamp:     z.number(),
+  confirmed:     z.boolean(),
 });
+
+const SystemStateSchema = z.object({
+  version:                 z.string(),
+  openPositions:           z.array(PositionSchema),
+  pendingTransactions:     z.array(TransactionSchema),
+  drawdownBaseline:        z.number(),
+  circuitBreakerActive:    z.boolean(),
+  emergencyShutdown:       z.boolean(),
+  lastRegimes:             z.record(z.enum(['bull', 'bear', 'sideways'])).default({}),
+  savedAt:                 z.number(),
+  checksum:                z.string(),
+  // .default(null) handles old state files that predate this field
+  competitionRegistration: CompetitionRegistrationSchema.nullable().default(null),
+}) as unknown as z.ZodType<SystemState>;
 
 // ─── StateManager ─────────────────────────────────────────────────────────────
 
@@ -145,12 +154,20 @@ export class StateManager {
 
       const state: SystemState = parsed.data;
 
-      // Checksum verification
-      if (!this.verifyChecksum(state)) {
+      // Checksum verification — skip for pre-v2 state files that predate
+      // competitionRegistration. Zod's .default(null) adds the field after
+      // the fact, so the stored checksum (computed without it) would never
+      // match. The next saveState() will recompute and persist the new checksum.
+      const rawObj = json as Record<string, unknown>;
+      const isMigratedState = !('competitionRegistration' in rawObj);
+      if (!isMigratedState && !this.verifyChecksum(state)) {
         const msg = 'State file checksum mismatch — file may be corrupted';
         logger.error(msg, { path: filePath });
         this.bus.emit('state:corrupted', { path: filePath, error: msg });
         return err(new StateError(msg));
+      }
+      if (isMigratedState) {
+        logger.info('State file migrated to v2 (competitionRegistration added)', { path: filePath });
       }
 
       this.bus.emit('state:loaded', { state });
@@ -206,14 +223,15 @@ export class StateManager {
 
   emptyState(): SystemState {
     const blank: Omit<SystemState, 'checksum'> = {
-      version:              '1.0.0',
-      openPositions:        [],
-      pendingTransactions:  [],
-      drawdownBaseline:     0,
-      circuitBreakerActive: false,
-      emergencyShutdown:    false,
-      lastRegimes:          {},
-      savedAt:              Date.now(),
+      version:                 '2.0.0',
+      openPositions:           [],
+      pendingTransactions:     [],
+      drawdownBaseline:        0,
+      circuitBreakerActive:    false,
+      emergencyShutdown:       false,
+      lastRegimes:             {},
+      savedAt:                 Date.now(),
+      competitionRegistration: null,
     };
     const checksum = this.computeChecksum(blank);
     return { ...blank, checksum };

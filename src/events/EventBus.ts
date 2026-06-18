@@ -11,6 +11,7 @@ import type {
   PerformanceMetrics,
   SystemState,
   Venue,
+  CompetitionRegistration,
 } from '../types/index';
 
 // ─── Event Catalog ───────────────────────────────────────────────────────────
@@ -78,6 +79,9 @@ export interface AgentEvents {
   'health:shutdown':                [{ reason: string; timestamp: number }];
   'health:latency':                 [{ latencyMs: number; threshold: number }];
   'health:circuit_breaker_reset':   [{ timestamp: number }];
+
+  // Registration
+  'registration:submitted': [CompetitionRegistration];
 
   // Unused imports kept for completeness — Order is referenced elsewhere
   'engine:order_created': [{ order: Order }];

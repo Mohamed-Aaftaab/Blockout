@@ -16,6 +16,7 @@ import { MomentumStrategy }          from './strategies/MomentumStrategy';
 import { MeanReversionStrategy }     from './strategies/MeanReversionStrategy';
 import { RangeStrategy }             from './strategies/RangeStrategy';
 import { StateManager }              from './state/StateManager';
+import { registrationGate }         from './registration/RegistrationService';
 import { AnalyticsEngine }           from './analytics/AnalyticsEngine';
 import { HealthMonitor }             from './health/HealthMonitor';
 import type {
@@ -70,6 +71,9 @@ async function bootstrap(): Promise<void> {
   const stateResult = await stateMgr.loadState();
   // Use a mutable reference so state updates are reflected everywhere
   let currentState: SystemState = stateResult.ok ? stateResult.value : stateMgr.emptyState();
+
+  // Hard gate: refuse to start in mainnet mode without a confirmed registration
+  registrationGate(cfg.network.mode, currentState);
 
   // Mutex serialises all currentState mutations to prevent concurrent write corruption
   const stateMutex = new StateMutex();
