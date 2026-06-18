@@ -78,8 +78,10 @@ export class HealthMonitor {
       this.bus.off('risk:circuit_breaker', this.circuitBreakerListener);
       this.circuitBreakerListener = null;
     }
-    // Reset startTime so start() can be called again if needed (e.g. service restart)
-    this.startTime = 0;
+    // Reset both startTime and shutdownTriggered so start() and triggerEmergencyShutdown()
+    // work correctly if this monitor is stopped and restarted (e.g., in recovery scenarios).
+    this.startTime         = 0;
+    this.shutdownTriggered = false;
     logger.info('HealthMonitor stopped');
   }
 
@@ -131,7 +133,7 @@ export class HealthMonitor {
     return () => clearTimeout(handle);
   }
 
-  /** Periodic RPC liveness ping. Emits health:warning if the node is unreachable. */
+  /** Periodic RPC liveness ping. Emits health:warning and triggers failover if the node is unreachable. */
   private async pingRpc(): Promise<void> {
     if (this.tradingEngine === null) return;
     try {
@@ -140,11 +142,26 @@ export class HealthMonitor {
       // getBlockNumber is the lightest possible RPC call
       await provider.getBlockNumber();
     } catch (e) {
-      logger.warn('RPC liveness ping failed — node may be unreachable', { error: String(e) });
+      logger.warn('RPC liveness ping failed — attempting failover', { error: String(e) });
       this.bus.emit('health:warning', {
         component: 'HealthMonitor',
         message:   `RPC ping failed: ${String(e)}`,
       });
+      // Proactively attempt failover so the next trade uses a live endpoint,
+      // rather than waiting for the next transaction attempt to discover the dead node.
+      try {
+        const failed = await this.tradingEngine.failoverRPC();
+        if (!failed) {
+          logger.error('RPC ping: all failover endpoints exhausted — agent has no live RPC');
+          this.bus.emit('health:critical', {
+            component: 'HealthMonitor',
+            message:   'RPC ping: all endpoints unreachable. Trading paused until an RPC recovers.',
+            timestamp: Date.now(),
+          });
+        }
+      } catch (failoverErr) {
+        logger.error('RPC failover during ping threw unexpectedly', { error: String(failoverErr) });
+      }
     }
   }
 

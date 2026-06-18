@@ -690,7 +690,10 @@ async function bootstrap(): Promise<void> {
       }
 
       // ── Emergency close-all open positions ────────────────────────────────
-      // shutdownIsEmergency may have been flipped by an escalation above
+      // Re-read shutdownIsEmergency here (not at IIFE creation time) so an escalation
+      // that arrives while TWAP-warn async work is in progress is still honoured.
+      // JavaScript is single-threaded: escalation sets the flag synchronously before
+      // returning, so by the time we resume here the flag reflects the latest intent.
       if (shutdownIsEmergency && openPositionMap.size > 0) {
         logger.warn('Emergency shutdown — attempting to close all open positions', {
           count: openPositionMap.size,

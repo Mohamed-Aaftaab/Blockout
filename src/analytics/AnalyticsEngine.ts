@@ -187,7 +187,8 @@ export class AnalyticsEngine {
       `Max Drawdown:    ${m.maxDrawdownPct.toFixed(1)}%`,
       `Avg Slippage:    ${m.avgSlippagePct.toFixed(3)}%`,
       `Latency P95:     ${m.latencyP95Ms.toFixed(0)}ms`,
-      `Open Positions:  ${Object.keys(m.byPair).length} pairs`,
+      // "Pairs Traded" counts distinct pairs with trade history — not current open positions.
+      `Pairs Traded:    ${Object.keys(m.byPair).length}`,
     ].join('\n');
   }
 

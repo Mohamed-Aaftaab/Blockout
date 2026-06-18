@@ -2,6 +2,8 @@
 
 **Autonomous AI Trading Agent — BNB Hack: AI Trading Agent Edition 2026**
 
+[![CI](https://github.com/Mohamed-Aaftaab/Blockout/actions/workflows/ci.yml/badge.svg)](https://github.com/Mohamed-Aaftaab/Blockout/actions/workflows/ci.yml)
+
 Blockout is a production-grade autonomous AI trading agent for BNB Smart Chain. It **blocks out MEV bots** using the Anaconda Squeeze TWAP strategy, streams live intelligence from CoinMarketCap, signs and submits on-chain transactions through a persistent self-custody ethers wallet, and executes trades on PancakeSwap V2 — all without any human in the loop.
 
 ---
@@ -75,16 +77,30 @@ The agent loads `.env` automatically via `dotenv` on both `npm run dev` and `npm
 
 ### Wallet Setup
 
-On first run, a self-custody wallet is created and saved to `data/wallet.key` (mode 0600, gitignored). Fund this address with testnet BNB before trading:
+On first run, a self-custody wallet is created and saved to `data/wallet.key` (mode 0600, gitignored). The wallet address is printed in the startup log — look for the line:
+
+```
+{"level":"info","message":"Created new wallet","address":"0x..."}
+```
+
+Or after a restart:
+
+```
+{"level":"info","message":"Loaded existing wallet","address":"0x..."}
+```
+
+Fund this address with testnet BNB before trading:
 
 ```
 # Testnet faucet: https://testnet.bnbchain.org/faucet-smart
 ```
 
+> **Note:** Always run the agent from the repository root directory (`cd Blockout && npm run dev`) so that the `data/` state directory resolves to the correct path. Running from another directory will put state files in the wrong location.
+
 ### Running Tests
 
 ```bash
-npm test                # Unit + property-based tests (44 tests)
+npm test                # Unit + property-based tests
 npm run test:coverage   # With coverage report
 npm run typecheck       # Type-check only
 ```

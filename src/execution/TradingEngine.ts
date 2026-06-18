@@ -157,16 +157,21 @@ export class TradingEngine {
   /**
    * Wraps any RPC call in a timeout using rpcTimeoutMs from config.
    * Prevents a hung RPC node from stalling the SL/TP monitor or signal pipeline.
+   * Uses a clearable timer so the timeout handle is cancelled when the RPC resolves
+   * quickly — prevents accumulating pending setTimeout handles during busy sessions.
    */
   private withRpcTimeout<T>(call: Promise<T>): Promise<T> {
     const cfg = this.config.get();
     const timeoutMs = cfg.network.rpcTimeoutMs;
-    return Promise.race([
-      call,
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`RPC call timed out after ${timeoutMs}ms`)), timeoutMs),
-      ),
-    ]);
+    return new Promise<T>((resolve, reject) => {
+      const handle = setTimeout(() => {
+        reject(new Error(`RPC call timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      call.then(
+        (result) => { clearTimeout(handle); resolve(result); },
+        (err: unknown) => { clearTimeout(handle); reject(err as Error); },
+      );
+    });
   }
 
   async routeOrder(order: Order): Promise<Result<Transaction, EngineError>> {
