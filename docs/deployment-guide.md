@@ -1,6 +1,6 @@
 # Deployment Guide
 
-This guide covers all supported deployment modes for the Sovereign BNB Agent.
+This guide covers all supported deployment modes for **Blockout** — the autonomous AI trading agent for BNB Smart Chain.
 
 ---
 
@@ -14,8 +14,8 @@ Before running the agent in any mode, ensure the following are in place:
    - Public: `https://bsc-dataseed1.binance.org` (may have rate limits)
    - Private: [QuickNode](https://www.quicknode.com/), [Ankr](https://www.ankr.com/), [NodeReal](https://nodereal.io/)
    - Recommended: configure 3+ endpoints in `RPC_ENDPOINTS` for automatic failover
-4. **CoinMarketCap Pro API key** — Required, min 32 characters. Free tier may be rate-limited; the agent polls every 60 seconds.
-5. **Trust Wallet Agent Kit credentials** — `TWAK_ACCESS_ID` and `TWAK_HMAC_SECRET` from your TWAK dashboard.
+4. **CoinMarketCap Pro API key** — Required, min 32 characters. The agent polls every 60 seconds and falls back to price-momentum signals if the v3 indicator endpoint is unavailable.
+5. **Trust Wallet Agent Kit credentials** — Optional. `TWAK_ACCESS_ID` and `TWAK_HMAC_SECRET` are reserved for when the TWAK SDK publishes to npm. The agent runs fully without them using a self-custody ethers.Wallet.
 
 ---
 
@@ -23,8 +23,8 @@ Before running the agent in any mode, ensure the following are in place:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/sovereign-bnb-agent.git
-cd sovereign-bnb-agent
+git clone https://github.com/Mohamed-Aaftaab/Blockout.git
+cd Blockout
 
 # Install all dependencies (pinned versions for reproducibility)
 npm install
@@ -53,8 +53,6 @@ Edit `.env`:
 ```dotenv
 # Credentials
 CMC_API_KEY=your_cmc_pro_api_key_here_32_chars_min
-TWAK_ACCESS_ID=your_twak_access_id
-TWAK_HMAC_SECRET=your_twak_hmac_secret_min_16_chars
 
 # Network — TESTNET
 NETWORK_MODE=testnet
@@ -76,7 +74,7 @@ MIN_PORTFOLIO_USD=100
 ### 2. Start the Agent
 
 ```bash
-# Development mode with ts-node (no build step)
+# Development mode with ts-node (no build step, loads .env automatically)
 npm run dev
 
 # Or build first and run from dist/
@@ -90,10 +88,16 @@ Watch the logs for:
 ```
 {"level":"info","message":"TradingEngine initialized","endpoint":"https://data-seed-prebsc..."}
 {"level":"info","message":"MarketDataService started"}
-{"level":"info","message":"Agent running in testnet mode"}
+{"level":"info","message":"System READY — Blockout is live"}
 ```
 
-The agent persists state to `./data/state.json`. On restart it loads the previous state, verifies the SHA-256 checksum, and resumes open positions.
+On first run, a self-custody wallet is created and saved to `data/wallet.key` (mode 0600, gitignored). Fund this address with testnet BNB:
+
+```
+Testnet faucet: https://testnet.bnbchain.org/faucet-smart
+```
+
+The agent persists state to `./data/state.json`. On restart it loads the previous state, verifies the SHA-256 checksum, and resumes monitoring open positions.
 
 ---
 
@@ -106,8 +110,6 @@ The agent persists state to `./data/state.json`. On restart it loads the previou
 ```dotenv
 # Credentials
 CMC_API_KEY=your_cmc_pro_api_key_here_32_chars_min
-TWAK_ACCESS_ID=your_twak_access_id
-TWAK_HMAC_SECRET=your_twak_hmac_secret_min_16_chars
 
 # Network — MAINNET
 NETWORK_MODE=mainnet
@@ -132,13 +134,17 @@ LEVERAGE_MULTIPLIER=1
 GAS_URGENCY_MULTIPLIER=1.3
 MIN_GAS_GWEI=3
 MAX_GAS_GWEI=200
+
+# Slippage — 1.5% default handles BSC V2 pool variance
+DEFAULT_SLIPPAGE_PCT=1.5
+MAX_SLIPPAGE_PCT=5.0
 ```
 
 ### 2. Build and Start
 
 ```bash
 npm run build
-NETWORK_MODE=mainnet npm start
+npm start
 ```
 
 ### 3. Mainnet Safety Checklist
@@ -148,9 +154,8 @@ Before going live, confirm:
 - [ ] `MAX_DRAWDOWN_PCT` is set to a value you are comfortable losing
 - [ ] `MAX_POSITION_PCT` limits exposure per trade
 - [ ] Multiple `RPC_ENDPOINTS` are configured for failover
-- [ ] `PANCAKESWAP_ROUTER` is the correct mainnet address
+- [ ] `PANCAKESWAP_ROUTER` is the correct mainnet V2 address
 - [ ] State and analytics directories (`./data/`) have write permissions
-- [ ] The TWAK signing key has been tested on testnet
 - [ ] You have reviewed all logs from a testnet run
 
 ---
@@ -170,7 +175,7 @@ npm start
 
 On completion the agent prints a detailed report:
 ```
-=== SOVEREIGN BNB AGENT — BACKTEST REPORT ===
+=== BLOCKOUT — BACKTEST REPORT ===
 Generated: 2024-07-01T00:00:00.000Z
 Total Trades:    247
 Win Rate:        58.3%
@@ -187,7 +192,7 @@ Latency P95:     N/A (simulated)
 
 ## Running Demo Mode
 
-Demo mode runs the full agent logic in real time but signs all transactions in a simulated wallet — no on-chain transactions occur.
+Demo mode runs the full agent logic in real time but does not submit on-chain transactions.
 
 ```bash
 # Run for 1 hour (3600 seconds)
@@ -206,8 +211,6 @@ Demo mode is useful for:
 
 ## Health Monitoring
 
-The `HealthMonitor` component runs periodic checks and emits events the orchestrator handles.
-
 ### Monitoring Endpoints
 
 The agent logs JSON-structured health information to stdout. Pipe to your log aggregator of choice:
@@ -222,9 +225,10 @@ npm start 2>&1 | tee agent.log | grep '"level":"error"'
 |---|---|---|
 | RPC connectivity | `health:critical` | Auto-failover to next RPC |
 | Signal-to-tx latency > target | `health:latency` | Warning log |
-| Circuit breaker triggered | `risk:circuit_breaker` | Trading halted; manual reset required |
+| Circuit breaker triggered | `risk:circuit_breaker` | Trading halted; reset via file signal |
 | State checksum mismatch | `state:corrupted` | Agent stops; fix state file |
-| CMC circuit open | `market:circuit_open` | CMC unreachable for 5+ minutes; agent idles |
+| CMC circuit open | `market:circuit_open` | CMC unreachable; agent idles |
+| Close order failed 5× | `health:critical` | Position stuck; manual intervention required |
 
 ### Checking Agent Status
 
@@ -238,7 +242,16 @@ cat ./data/analytics.json | jq '{pnl: .totalPnlUsd, winRate: .winRate, sharpe: .
 
 ### Resetting the Circuit Breaker
 
-The circuit breaker is reset only by restarting the agent after confirming the portfolio has recovered or after manually editing `./data/state.json` and setting `"circuitBreakerActive": false` with an updated checksum. Alternatively, wait for the portfolio to recover above the `drawdownBaseline`.
+Use the file-signal reset — no restart required:
+
+```bash
+touch ./RESET_CIRCUIT_BREAKER
+# HealthMonitor polls every SHUTDOWN_POLL_MS (default 5s),
+# deletes the file, and emits health:circuit_breaker_reset.
+# RiskManager resets and trading resumes immediately.
+```
+
+Alternatively, set `"circuitBreakerActive": false` in `./data/state.json` and restart — the StateManager will validate and load the updated state.
 
 ---
 
@@ -252,8 +265,8 @@ To immediately halt all trading and close the agent gracefully:
 # Create the shutdown signal file
 touch ./SHUTDOWN
 
-# The agent polls every SHUTDOWN_POLL_MS (default 5s) and shuts down when the file exists
-# It completes any in-flight transactions before stopping
+# The agent polls every SHUTDOWN_POLL_MS (default 5s) and shuts down when the file exists.
+# In-flight transactions complete before the process exits.
 ```
 
 ### Method 2: SIGTERM
@@ -267,26 +280,21 @@ kill -SIGTERM $(pgrep -f "node dist/index.js")
 
 ```bash
 # Press Ctrl+C in the terminal where the agent is running
-# The agent catches SIGINT and shuts down gracefully
 ```
 
 On shutdown the agent:
 1. Stops accepting new signals
-2. Waits for in-flight transactions to confirm (up to `TX_TIMEOUT_SEC`)
-3. Saves final state to `STATE_FILE_PATH`
+2. Completes in-flight transactions (up to `TX_TIMEOUT_SEC`)
+3. Saves final state to `STATE_FILE_PATH` (atomic write with SHA-256)
 4. Writes a shutdown report to the log
 5. Exits with code 0
-
-The shutdown file is automatically removed after the agent exits.
 
 ---
 
 ## Upgrading
 
-To upgrade to a new version:
-
 ```bash
-# 1. Stop the agent (gracefully)
+# 1. Stop the agent
 touch ./SHUTDOWN
 sleep 10
 
@@ -295,19 +303,16 @@ cp ./data/state.json ./data/state.json.backup
 cp .env .env.backup
 
 # 3. Pull new code
-git pull origin main
+git pull origin master
 
 # 4. Install updated dependencies
 npm install
 
-# 5. Run migrations if any are listed in the CHANGELOG
-# (Migrations run automatically on first start)
-
-# 6. Type-check and test
+# 5. Type-check and test
 npm run typecheck
 npm test
 
-# 7. Remove the shutdown signal and restart
+# 6. Restart
 rm ./SHUTDOWN
 npm run build
 npm start
@@ -315,10 +320,10 @@ npm start
 
 ### State Migration
 
-The `StateManager` includes a migration system in `src/state/migrations/`. On startup, if the persisted state's `version` field is older than the current version, migrations are applied automatically.
+The `StateManager` includes a migration system in `src/state/migrations/`. If the persisted state's `version` field is older than the current version, migrations run automatically on startup.
 
-Check the current state version:
 ```bash
+# Check current state version
 cat ./data/state.json | jq .version
 ```
 
@@ -326,18 +331,20 @@ cat ./data/state.json | jq .version
 
 ## Production Best Practices
 
-1. **Use a process manager**: Run the agent under `pm2` or `systemd` for automatic restart on crash:
+1. **Use a process manager** — Run under `pm2` for automatic restart on crash:
    ```bash
    npm install -g pm2
-   pm2 start dist/index.js --name sovereign-bnb-agent
+   pm2 start dist/index.js --name blockout
    pm2 save
    pm2 startup
    ```
 
-2. **Log rotation**: The agent writes to stdout. Configure logrotate or `pm2`'s built-in log rotation to prevent unbounded disk usage.
+2. **Log rotation** — The agent writes to stdout. Configure `pm2` log rotation or `logrotate` to prevent unbounded disk usage.
 
-3. **Separate `.env` per environment**: Use `.env.testnet` and `.env.mainnet`. Never reuse testnet credentials on mainnet.
+3. **Separate `.env` per environment** — Never reuse testnet credentials on mainnet.
 
-4. **Monitor `MAX_GAS_GWEI`**: During BSC network congestion, you may need to increase `MAX_GAS_GWEI` temporarily or the agent will fail to get transactions included.
+4. **Monitor `MAX_GAS_GWEI`** — During BSC congestion, temporarily increase `MAX_GAS_GWEI` or transactions will fail to land.
 
-5. **Multiple RPC endpoints**: Configure at least 3 RPC endpoints. The agent automatically failovers with exponential backoff when an RPC node is unreachable.
+5. **Multiple RPC endpoints** — Configure at least 3. The agent failovers automatically with exponential backoff when an RPC node is unreachable.
+
+6. **State backup** — The periodic state save runs every `STATE_PERSIST_SEC` (default 30s). Back up `./data/state.json` regularly in production.

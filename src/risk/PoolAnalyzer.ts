@@ -100,38 +100,55 @@ export class PoolAnalyzer {
     return health;
   }
 
-  isHealthy(health: PoolHealth): boolean {
+  /**
+   * Evaluates pool health thresholds and returns a verdict object.
+   * Does NOT mutate the input — callers apply the result as needed.
+   */
+  checkHealth(health: PoolHealth): { healthy: boolean; rejectionReason: string | null } {
     const cfg = this.config.get().pool;
 
     if (health.totalReserveUsd < cfg.minReserveUsd) {
-      health.healthy         = false;
-      health.rejectionReason = `Insufficient reserve: $${health.totalReserveUsd.toFixed(0)} < $${cfg.minReserveUsd}`;
-      return false;
+      return {
+        healthy:         false,
+        rejectionReason: `Insufficient reserve: $${health.totalReserveUsd.toFixed(0)} < $${cfg.minReserveUsd}`,
+      };
     }
 
     const volToReservePct = health.totalReserveUsd > 0
       ? (health.volume24h / health.totalReserveUsd) * 100
       : 0;
     if (volToReservePct < cfg.minVolToReservePct) {
-      health.healthy         = false;
-      health.rejectionReason = `Low volume/reserve ratio: ${volToReservePct.toFixed(2)}% < ${cfg.minVolToReservePct}%`;
-      return false;
+      return {
+        healthy:         false,
+        rejectionReason: `Low volume/reserve ratio: ${volToReservePct.toFixed(2)}% < ${cfg.minVolToReservePct}%`,
+      };
     }
 
     if (health.txCount24h < cfg.minTxCount24h) {
-      health.healthy         = false;
-      health.rejectionReason = `Low transaction count: ${health.txCount24h} < ${cfg.minTxCount24h}`;
-      return false;
+      return {
+        healthy:         false,
+        rejectionReason: `Low transaction count: ${health.txCount24h} < ${cfg.minTxCount24h}`,
+      };
     }
 
     if (health.reserveDrainPct > cfg.maxReserveDrainPct) {
-      health.healthy         = false;
-      health.rejectionReason = `Reserve drain too high: ${health.reserveDrainPct.toFixed(1)}% > ${cfg.maxReserveDrainPct}%`;
-      return false;
+      return {
+        healthy:         false,
+        rejectionReason: `Reserve drain too high: ${health.reserveDrainPct.toFixed(1)}% > ${cfg.maxReserveDrainPct}%`,
+      };
     }
 
-    health.healthy         = true;
-    health.rejectionReason = null;
-    return true;
+    return { healthy: true, rejectionReason: null };
+  }
+
+  /**
+   * @deprecated Use checkHealth() — isHealthy() mutates the input object.
+   * Kept for backwards-compat with existing tests; delegates to checkHealth().
+   */
+  isHealthy(health: PoolHealth): boolean {
+    const verdict          = this.checkHealth(health);
+    health.healthy         = verdict.healthy;
+    health.rejectionReason = verdict.rejectionReason;
+    return verdict.healthy;
   }
 }

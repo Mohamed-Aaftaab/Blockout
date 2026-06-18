@@ -463,7 +463,7 @@ async function bootstrap(): Promise<void> {
 
     const execResult = await executionSvc.executeOrder(closeOrder);
 
-    // ── Issue K: cap retries at 5 to prevent infinite retry loop ──────────────
+    // ── Cap retries at 5 to prevent infinite retry loop ──────────────────────
     if (!execResult.ok) {
       const newRetries = closeRetries + 1;
       const maxRetries = 5;
@@ -476,7 +476,19 @@ async function bootstrap(): Promise<void> {
           message:   `Position ${positionId} stuck after ${maxRetries} close attempts: ${execResult.error.message}`,
           timestamp: Date.now(),
         });
-        // Fall through to cleanup so internal state doesn't show it as open forever
+        // No actual sale occurred — record zero PnL so metrics are not inflated
+        // with estimated values for a trade that never executed on-chain.
+        const tradeRecordFailed: TradeRecord = {
+          id: uuid(), position, closePrice: exitPrice, closedAt: Date.now(),
+          exitReason: reason, pnlUsd: 0, pnlPct: 0,
+          holdMs: Date.now() - openedAt, transactions: [], signalToTxMs: 0,
+        };
+        analytics.recordTrade(tradeRecordFailed);
+        await stateMutex.run(async () => {
+          currentState = { ...currentState, openPositions: currentState.openPositions.filter(p => p.id !== positionId) };
+          await stateMgr.saveState(currentState);
+        });
+        return;
       } else {
         logger.error('Close order failed — restoring position for SL/TP retry', {
           positionId, pair: position.pair, reason, retries: newRetries, error: execResult.error.message,
@@ -491,7 +503,7 @@ async function bootstrap(): Promise<void> {
       }
     }
 
-    const closeTxs = execResult.ok ? [execResult.value] : [];
+    const closeTxs = [execResult.value];
 
     // PnL calculation — use closeSize (what was actually closed) not position.size
     // (which may have been capped by partial fill balance check above).
