@@ -8,18 +8,18 @@ Blockout is a production-grade autonomous AI trading agent for BNB Smart Chain. 
 
 ## Sponsor Integrations
 
-### CoinMarketCap Agent Hub
+### CoinMarketCap
 
-The agent uses the [CoinMarketCap Pro API](https://coinmarketcap.com/api/) as its primary market-data oracle.
+The agent uses the [CoinMarketCap Pro API](https://coinmarketcap.com/api/) as its primary market-data oracle via raw HTTP endpoints.
 
 **Endpoints used:**
 | Endpoint | Purpose |
 |---|---|
 | `GET /v2/cryptocurrency/quotes/latest` | Real-time price, volume, market cap |
-| `GET /v2/cryptocurrency/ohlcv/historical` | Candlestick data for signal computation |
-| `GET /v3/cryptocurrency/technical-indicator/latest` | RSI-14, MACD, Bollinger Bands (Agent Hub tier) |
+| `GET /v2/cryptocurrency/ohlcv/historical` | Candlestick data for indicator computation |
+| `GET /v3/cryptocurrency/technical-indicator/latest` | RSI-14, MACD, Bollinger Bands (falls back to neutral defaults if the API key tier does not include v3 indicator access) |
 
-The agent is resilient to indicator endpoint unavailability — if the `/v3` endpoint is not accessible, it automatically falls back to price-momentum signals computed from OHLCV candles.
+At startup, `MarketDataService` probes `GET /v4/agent/market-insights` to detect CMC Agent Hub access and logs the result. If Agent Hub is available on the configured key, its pre-computed regime/liquidity/risk signals can supplement or replace the raw indicator math in `SignalGenerator`. This is not yet wired — the probe is informational only and leaves existing behaviour unchanged.
 
 **Getting an API key:**
 1. Register at https://coinmarketcap.com/api/

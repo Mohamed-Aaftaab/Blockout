@@ -84,6 +84,8 @@ export class MarketDataService {
 
   async start(): Promise<void> {
     const cfg = this.config.get();
+    // Probe CMC Agent Hub availability and log the result (fire-and-forget)
+    void this.detectAgentHubAccess();
     // Verify API access
     const firstPair = cfg.tradingPairs[0] ?? 'BNB/USDT';
     try {
@@ -126,6 +128,24 @@ export class MarketDataService {
   stop(): void {
     for (const h of this.intervals) clearInterval(h);
     this.intervals.length = 0;
+  }
+
+  private async detectAgentHubAccess(): Promise<void> {
+    const cfg = this.config.get();
+    try {
+      await this.http.get('/v4/agent/market-insights', {
+        headers: { 'X-CMC_PRO_API_KEY': cfg.cmcApiKey },
+        params:  { limit: 1 },
+      });
+      logger.info('CMC Agent Hub access confirmed — /v4/agent/market-insights is available on this API key');
+    } catch (e: unknown) {
+      const status = (e as { response?: { status?: number } }).response?.status;
+      if (status === 401 || status === 403) {
+        logger.info('CMC Agent Hub not available on current API key tier — using raw Pro API endpoints');
+      } else {
+        logger.debug('CMC Agent Hub probe inconclusive', { status, error: String(e) });
+      }
+    }
   }
 
   getLatestData(pair: string): MarketData | null {
