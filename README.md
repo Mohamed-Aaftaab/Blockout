@@ -76,7 +76,9 @@ cp .env.example .env
 # 3a. Run in testnet mode (safe, default)
 npm run dev
 
-# 3b. Run in mainnet mode (LIVE TRADING — real funds at risk)
+# 5b. Run in mainnet mode (LIVE TRADING — real funds at risk)
+# First, register with the competition contract (one-off, required before mainnet):
+npm run register
 NETWORK_MODE=mainnet npm start
 ```
 
@@ -206,6 +208,35 @@ Blockout/
 ├── jest.config.ts
 └── tsconfig.json         # TypeScript strict mode
 ```
+
+---
+
+## Environment Variables
+
+See [docs/configuration-reference.md](docs/configuration-reference.md) for the full table of all 35 variables.
+
+**Required variables (no defaults):**
+
+| Variable | Description |
+|---|---|
+| `CMC_API_KEY` | CoinMarketCap Pro API key (min 32 chars) |
+| `TWAK_ACCESS_ID` | Trust Wallet Agent Kit access ID (optional — CLI handles auth) |
+| `TWAK_HMAC_SECRET` | Trust Wallet Agent Kit HMAC secret (optional — CLI handles auth) |
+| `RPC_ENDPOINTS` | Comma-separated BSC RPC URLs |
+| `CHAIN_ID` | 56 (mainnet) or 97 (testnet) |
+| `TRADING_PAIRS` | Comma-separated pairs e.g. `BNB/USDT,CAKE/USDT` |
+| `PANCAKESWAP_ROUTER` | PancakeSwap V2 Router contract address |
+| `BSC_PERPS_CONTRACT` | BSC Perpetuals contract address |
+
+---
+
+## Safety Features
+
+- **Circuit breaker**: automatically halts trading if drawdown exceeds `MAX_DRAWDOWN_PCT`
+- **TWAP / MEV defense**: splits orders above `TWAP_THRESHOLD_USD` into randomized time-weighted chunks
+- **Dead-coin filter**: `PoolAnalyzer` rejects pools with insufficient liquidity or activity
+- **State persistence**: atomic writes with SHA-256 checksums prevent corrupt state on restart
+- **Emergency shutdown**: `touch SHUTDOWN` (or set `SHUTDOWN_SIGNAL_FILE` path) gracefully stops the agent
 
 ---
 
