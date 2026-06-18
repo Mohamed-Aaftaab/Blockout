@@ -52,17 +52,11 @@ curl -fsSL https://agent-kit.trustwallet.com/install.sh | bash
 
 ### BNB AI Agent SDK
 
-The BNB AI Agent SDK integration contract is documented in `src/execution/BNBAgentAdapter.ts`. The agent uses ethers.js v6 with BSC RPC for equivalent on-chain interactions. When the BNB SDK publishes, the `TradingEngine` provider and signer can be replaced with the SDK's agent-native equivalents.
+Not integrated. `@bnb-chain/bnbagent-sdk` is not published on npm (verified 2026-06-18). The package targets ERC-8004 identity registration and APEX agent commerce, not trading-competition execution or scoring. This is not a meaningful integration for this track.
 
-**Current on-chain capabilities:**
-| Feature | Implementation |
-|---|---|
-| BSC RPC with failover | `TradingEngine` with exponential backoff |
-| PancakeSwap V2 swaps | `buildSwapPlan()` with correct token sort order |
-| Pool reserve queries | V2 Factory `getPair()` + `getReserves()` |
-| ERC-20 approve + swap | Full two-step approval flow |
-| Gas estimation | `provider.getFeeData()` + `estimateGas()` |
-| Portfolio valuation | Native BNB + ERC-20 token balances |
+`src/execution/BNBAgentAdapter.ts` documents this decision.
+
+BSC network interaction (RPC provider, PancakeSwap V2 swaps, BSC Perpetuals, gas estimation) is handled directly via `ethers` v6 in `TradingEngine`. Network switching: set `NETWORK_MODE=mainnet` and `CHAIN_ID=56` for live trading. Defaults to `testnet` (Chain ID 97).
 
 ---
 
