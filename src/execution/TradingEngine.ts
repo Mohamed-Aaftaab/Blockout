@@ -617,9 +617,10 @@ export class TradingEngine {
       const address = walletAddress ?? this.wallet?.address;
       if (!address) return 0;
 
-      // Short-lived cache (5s) to prevent 13+ RPC calls per signal invocation
+      // Short-lived cache (5s) to prevent 13+ RPC calls per signal invocation.
+      // Cache is valid even when value=0 (empty wallet) to avoid constant RPC polling.
       const now = Date.now();
-      if (now < this.portfolioCache.expiresAt && this.portfolioCache.value > 0) {
+      if (now < this.portfolioCache.expiresAt) {
         return this.portfolioCache.value;
       }
 

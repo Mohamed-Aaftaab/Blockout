@@ -58,6 +58,8 @@ export class HealthMonitor {
       this.bus.off('risk:circuit_breaker', this.circuitBreakerListener);
       this.circuitBreakerListener = null;
     }
+    // Reset startTime so start() can be called again if needed (e.g. service restart)
+    this.startTime = 0;
     logger.info('HealthMonitor stopped');
   }
 

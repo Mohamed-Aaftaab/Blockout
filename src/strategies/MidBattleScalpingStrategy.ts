@@ -10,15 +10,13 @@ export class MidBattleScalpingStrategy implements IStrategy {
   weight:   number;
   isActive: boolean = true;
 
-  private readonly config:   ConfigurationService;
-  private readonly bus:      EventBus;
-  private readonly athMap:   Map<string, number> = new Map();
+  private readonly config:     ConfigurationService;
+  private readonly athMap:     Map<string, number> = new Map();
   // Track last known real price per pair (updated via onMarketData)
   private readonly lastPrices: Map<string, number> = new Map();
 
-  constructor(config: ConfigurationService, bus: EventBus) {
+  constructor(config: ConfigurationService, _bus: EventBus) {
     this.config = config;
-    this.bus    = bus;
     this.weight = 0.4;
   }
 

@@ -114,9 +114,7 @@ describe('ConfigurationService', () => {
 
   it('load() returns err when CMC_API_KEY env var is missing', () => {
     delete process.env['CMC_API_KEY'];
-    // Set a minimal environment so the only failure is cmcApiKey
-    process.env['TWAK_ACCESS_ID']       = 'abcdefgh';
-    process.env['TWAK_HMAC_SECRET']     = 'a'.repeat(16);
+    // Set minimal environment — TWAK fields are now optional, no need to set them
     process.env['TRADING_PAIRS']        = 'BNB/USDT';
     process.env['RPC_ENDPOINTS']        = 'https://bsc-dataseed1.binance.org';
     process.env['CHAIN_ID']             = '97';

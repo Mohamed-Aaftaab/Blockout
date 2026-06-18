@@ -1,8 +1,8 @@
 # Blockout
 
-**Autonomous AI Trading Agent — BNB Hack 2026**
+**Autonomous AI Trading Agent — BNB Hack: AI Trading Agent Edition 2026**
 
-Blockout is a production-grade autonomous AI trading agent for BNB Smart Chain. It **blocks out MEV bots** using the Anaconda Squeeze TWAP strategy, streams live intelligence from CoinMarketCap, signs and submits on-chain transactions through Trust Wallet Agent Kit, and executes trades on PancakeSwap and BSC Perpetuals — all without any human in the loop.
+Blockout is a production-grade autonomous AI trading agent for BNB Smart Chain. It **blocks out MEV bots** using the Anaconda Squeeze TWAP strategy, streams live intelligence from CoinMarketCap, signs and submits on-chain transactions through a persistent self-custody ethers wallet, and executes trades on PancakeSwap V2 — all without any human in the loop.
 
 ---
 
@@ -16,98 +16,88 @@ The agent uses the [CoinMarketCap Pro API](https://coinmarketcap.com/api/) as it
 | Endpoint | Purpose |
 |---|---|
 | `GET /v2/cryptocurrency/quotes/latest` | Real-time price, volume, market cap |
-| `GET /v2/cryptocurrency/ohlcv/historical` | Candlestick data for indicator computation |
-| `GET /v3/cryptocurrency/technical-indicator/latest` | RSI-14, MACD, Bollinger Bands |
+| `GET /v2/cryptocurrency/ohlcv/historical` | Candlestick data for signal computation |
+| `GET /v3/cryptocurrency/technical-indicator/latest` | RSI-14, MACD, Bollinger Bands (Agent Hub tier) |
+
+The agent is resilient to indicator endpoint unavailability — if the `/v3` endpoint is not accessible, it automatically falls back to price-momentum signals computed from OHLCV candles.
 
 **Getting an API key:**
 1. Register at https://coinmarketcap.com/api/
-2. Choose a plan (Basic tier works for testing; Pro tier for production polling at 60s intervals)
-3. Copy your key into `.env` as `CMC_API_KEY`
-
-The key must be at least 32 characters. The agent validates this at startup and refuses to run with a missing or short key.
+2. Copy your key into `.env` as `CMC_API_KEY`
 
 ---
 
 ### Trust Wallet Agent Kit (TWAK)
 
-The agent uses [Trust Wallet Agent Kit](https://developer.trustwallet.com/agent-kit) for **self-custody transaction signing in autonomous mode**. No private key is ever transmitted to a third party.
+The agent implements the Trust Wallet Agent Kit integration contract in `src/execution/TWAKAdapter.ts`. The TWAK credentials (`TWAK_ACCESS_ID`, `TWAK_HMAC_SECRET`) are pre-loaded and validated but TWAK is currently in pre-release. The agent uses an equivalent self-custody ethers.Wallet with the same security model — keys never leave the device.
 
-**Integration pattern:**
-1. TWAK is initialized with `TWAK_ACCESS_ID` and `TWAK_HMAC_SECRET` from environment
-2. The `ExecutionService` requests a signed transaction payload from TWAK for each order
-3. TWAK signs the transaction locally and returns the raw signed bytes
-4. The agent broadcasts the signed transaction to BSC via its configured RPC endpoints
-
-**Autonomous mode:** TWAK's autonomous signing mode allows the agent to submit transactions without interactive approval. This is enabled by setting your HMAC secret in `.env`.
-
-> **Security note:** Never commit `.env` to source control. The `.gitignore` excludes it by default.
+When the TWAK SDK publishes to npm, switching is a one-file change in `ExecutionService.loadOrCreateWallet()`.
 
 ---
 
 ### BNB AI Agent SDK
 
-The agent uses the [BNB AI Agent SDK](https://docs.bnbchain.org/bnb-smart-chain/) to interact with BSC mainnet (Chain ID 56) and testnet (Chain ID 97).
+The BNB AI Agent SDK integration contract is documented in `src/execution/BNBAgentAdapter.ts`. The agent uses ethers.js v6 with BSC RPC for equivalent on-chain interactions. When the BNB SDK publishes, the `TradingEngine` provider and signer can be replaced with the SDK's agent-native equivalents.
 
-**Capabilities used:**
-| Feature | SDK Component |
+**Current on-chain capabilities:**
+| Feature | Implementation |
 |---|---|
-| BSC RPC provider with failover | `BNBAgentProvider` |
-| PancakeSwap V2 swaps | `PancakeSwapRouter` (0x10ED43C718714eb63d5aA57B78B54704E256024E) |
-| BSC Perpetuals long/short | `BSCPerpsContract` |
-| Pool reserve queries | `PancakeV3Factory` |
-| Gas estimation | `provider.getFeeData()` |
-
-**Network switching:** Set `NETWORK_MODE=mainnet` and `CHAIN_ID=56` for live trading. Defaults to `testnet` (Chain ID 97) for safe development.
+| BSC RPC with failover | `TradingEngine` with exponential backoff |
+| PancakeSwap V2 swaps | `buildSwapPlan()` with correct token sort order |
+| Pool reserve queries | V2 Factory `getPair()` + `getReserves()` |
+| ERC-20 approve + swap | Full two-step approval flow |
+| Gas estimation | `provider.getFeeData()` + `estimateGas()` |
+| Portfolio valuation | Native BNB + ERC-20 token balances |
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/your-username/sovereign-bnb-agent.git
-cd sovereign-bnb-agent
-
-# 2. Install dependencies
+# 1. Clone and install
+git clone https://github.com/Mohamed-Aaftaab/Blockout.git
+cd Blockout
 npm install
 
-# 3. Copy the example environment file
+# 2. Configure environment
 cp .env.example .env
+# Edit .env — minimum required: CMC_API_KEY, RPC_ENDPOINTS, CHAIN_ID, 
+#             PANCAKESWAP_ROUTER, BSC_PERPS_CONTRACT, TRADING_PAIRS
 
-# 4. Edit .env with your API keys and configuration
-# Required: CMC_API_KEY, TWAK_ACCESS_ID, TWAK_HMAC_SECRET
-# Required: RPC_ENDPOINTS, CHAIN_ID, PANCAKESWAP_ROUTER
-nano .env   # or your editor of choice
-
-# 5a. Run in testnet mode (safe, default)
+# 3a. Run in testnet mode (safe, default)
 npm run dev
 
-# 5b. Run in mainnet mode (LIVE TRADING — real funds at risk)
+# 3b. Run in mainnet mode (LIVE TRADING — real funds at risk)
 NETWORK_MODE=mainnet npm start
+```
+
+The agent loads `.env` automatically via `dotenv` on both `npm run dev` and `npm start`.
+
+### Wallet Setup
+
+On first run, a self-custody wallet is created and saved to `data/wallet.key` (mode 0600, gitignored). Fund this address with testnet BNB before trading:
+
+```
+# Testnet faucet: https://testnet.bnbchain.org/faucet-smart
 ```
 
 ### Running Tests
 
 ```bash
-# Unit tests + property-based tests
-npm test
-
-# With coverage report
-npm run test:coverage
-
-# Type-check only (no compilation output)
-npm run typecheck
+npm test                # Unit + property-based tests (44 tests)
+npm run test:coverage   # With coverage report
+npm run typecheck       # Type-check only
 ```
 
 ---
 
 ## Architecture Overview
 
-The agent is built as a layered event-driven system with 15 components communicating through a typed `EventBus`.
+The agent is an event-driven system with 15 components communicating through a typed `EventBus`.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    AgentOrchestrator                     │
+│                    Bootstrap (index.ts)                  │
 ├────────────┬──────────────┬──────────────┬──────────────┤
 │  Market    │  Strategy    │    Risk      │  Execution   │
 │  Layer     │  Layer       │    Layer     │  Layer       │
@@ -118,79 +108,95 @@ The agent is built as a layered event-driven system with 15 components communica
 │RegimeDet.  │RangeStrategy │              │MEVDefense    │
 │            │MidBattle     │              │              │
 ├────────────┴──────────────┴──────────────┴──────────────┤
-│          StateManager  │  AnalyticsEngine               │
-│          HealthMonitor │  EventBus                      │
+│        StateManager  │  AnalyticsEngine                 │
+│        HealthMonitor │  EventBus                        │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Data flow:**
-1. `MarketDataService` polls CMC every 60s and emits `market:data`
-2. `SignalGenerator` computes RSI/MACD/Bollinger/Whale signals and emits `signal:generated`
-3. `StrategyManager` routes the composite signal to the active strategy for the current regime
-4. `RiskManager` validates position size and exposure before accepting an order
-5. `MEVDefenseModule` splits large orders into TWAP chunks
-6. `ExecutionService` signs via TWAK and broadcasts to BSC
-7. `AnalyticsEngine` records the trade and updates Sharpe/drawdown metrics
+**Signal pipeline:**
+1. `MarketDataService` polls CMC every 60s → emits `market:data`
+2. `RegimeDetector` classifies market as bull / bear / sideways
+3. `SignalGenerator` computes RSI, MACD, Bollinger, whale, and price-momentum signals
+4. `StrategyManager` picks the winning strategy for the current regime
+5. `RiskManager` validates position size and exposure limits
+6. `MEVDefenseModule` (Anaconda Squeeze) splits large orders into randomized TWAP chunks
+7. `ExecutionService` sends approve + swap transactions to BSC via the nonce-serialized wallet
+8. `AnalyticsEngine` records the trade and updates Sharpe ratio, win rate, and drawdown
 
-**Full documentation:**
-- [Architecture](docs/architecture.md) — component diagram, event catalog, position lifecycle
-- [Configuration Reference](docs/configuration-reference.md) — all 35 environment variables
-- [Deployment Guide](docs/deployment-guide.md) — testnet, mainnet, backtest, demo, monitoring
+**Four trading strategies:**
+| Strategy | Regime | Signal |
+|---|---|---|
+| `MidBattleScalping` | Any | Buy when price drops ≥10% from session ATH (TWAP) |
+| `Momentum` | Bull | Buy/sell on composite confidence ≥0.6 |
+| `MeanReversion` | Bear | Buy RSI oversold or Bollinger lower band |
+| `Range` | Sideways | Buy at Bollinger lower, sell at upper |
+
+**Key correctness properties tested (property-based, fast-check):**
+- TWAP chunk sizes always sum exactly to `order.size`
+- Position SL always < entry, TP always > entry for buys (reversed for sells)
+- Gas price always clamped to `[minGasGwei, maxGasGwei]`
+- Signal confidence always in `[0.0, 1.0]`
+- State round-trips through persist/load with matching checksum
+- Strategy weights always normalize to sum 1.0
+
+---
+
+## Key Safety Features
+
+- **Circuit breaker**: halts trading if portfolio drawdown exceeds `MAX_DRAWDOWN_PCT` (default 20%). Persists across restarts. Reset via `touch RESET_CIRCUIT_BREAKER`.
+- **Anaconda Squeeze TWAP**: orders above threshold split into N randomized time-weighted chunks to prevent front-running
+- **Close size cap**: checks on-chain ERC-20 balance before selling to prevent reverts from partial fills
+- **Dead-coin filter**: `PoolAnalyzer` rejects pools with insufficient reserve, volume, or tx count
+- **State integrity**: atomic writes with SHA-256 checksums. Corrupted state detected on load.
+- **Nonce serialization**: concurrent pair executions are serialized through a nonce lock to prevent collisions
+- **Graceful shutdown**: `touch SHUTDOWN` triggers clean position close and final state save
+
+---
+
+## Configuration
+
+See `.env.example` for all 40+ configuration variables with comments.
+
+**Required variables (no defaults):**
+
+| Variable | Example |
+|---|---|
+| `CMC_API_KEY` | `your_key_here...` (min 32 chars) |
+| `RPC_ENDPOINTS` | `https://bsc-dataseed1.binance.org` |
+| `CHAIN_ID` | `97` (testnet) or `56` (mainnet) |
+| `TRADING_PAIRS` | `BNB/USDT,CAKE/USDT` |
+| `PANCAKESWAP_ROUTER` | Testnet: `0xD99D1c33F9fC3444f8101754aBC46c52416550D1` |
+| `BSC_PERPS_CONTRACT` | `0x0000000000000000000000000000000000000000` |
+
+**TWAK credentials are optional** — the agent works without them using a local ethers wallet.
 
 ---
 
 ## Directory Structure
 
 ```
-sovereign-bnb-agent/
+Blockout/
 ├── src/
 │   ├── analytics/        # AnalyticsEngine — Sharpe, drawdown, P&L
-│   ├── config/           # ConfigurationService + Zod schema
-│   ├── events/           # Typed EventBus
+│   ├── config/           # ConfigurationService + Zod schema (40+ vars)
+│   ├── events/           # Typed EventBus (35+ events)
 │   ├── execution/        # TradingEngine, GasOptimizer, MEVDefense, ExecutionService
-│   ├── health/           # HealthMonitor
+│   │   ├── BNBAgentAdapter.ts   # BNB AI Agent SDK integration contract
+│   │   └── TWAKAdapter.ts       # Trust Wallet Agent Kit integration contract
+│   ├── health/           # HealthMonitor with circuit breaker wiring
 │   ├── market/           # MarketDataService, SignalGenerator, RegimeDetector
 │   ├── risk/             # RiskManager, PoolAnalyzer
-│   ├── state/            # StateManager with atomic writes + checksums
+│   ├── state/            # StateManager — atomic writes + SHA-256 checksums
 │   ├── strategies/       # IStrategy + 4 concrete strategies + StrategyManager
-│   ├── types/            # Shared types + error classes
-│   ├── utils/            # sleep, uuid, withRetry (exponential backoff)
-│   └── __tests__/        # Unit tests + property-based tests (fast-check)
-├── data/                 # Runtime state and analytics (gitignored)
-├── docs/                 # Documentation
-├── .env.example          # All 35 config vars with comments
-├── jest.config.ts        # Jest + ts-jest configuration
-└── tsconfig.json         # TypeScript strict config
+│   ├── types/            # Shared types, Result monad, error classes
+│   ├── utils/            # sleep, uuid, withRetry, makeLogger
+│   └── __tests__/        # 44 unit + property-based tests (fast-check)
+├── data/                 # Runtime state/analytics/wallet (gitignored)
+├── docs/                 # Architecture, config reference, deployment guide
+├── .env.example          # All config vars with comments and examples
+├── jest.config.ts
+└── tsconfig.json         # TypeScript strict mode
 ```
-
----
-
-## Environment Variables
-
-See [docs/configuration-reference.md](docs/configuration-reference.md) for the full table of all 35 variables.
-
-**Required variables (no defaults):**
-
-| Variable | Description |
-|---|---|
-| `CMC_API_KEY` | CoinMarketCap Pro API key (min 32 chars) |
-| `TWAK_ACCESS_ID` | Trust Wallet Agent Kit access ID |
-| `TWAK_HMAC_SECRET` | Trust Wallet Agent Kit HMAC secret (min 16 chars) |
-| `RPC_ENDPOINTS` | Comma-separated BSC RPC URLs |
-| `CHAIN_ID` | 56 (mainnet) or 97 (testnet) |
-| `TRADING_PAIRS` | Comma-separated pairs e.g. `BNB/USDT,CAKE/USDT` |
-| `PANCAKESWAP_ROUTER` | PancakeSwap V2 Router contract address |
-| `BSC_PERPS_CONTRACT` | BSC Perpetuals contract address |
-
----
-
-## Safety Features
-
-- **Circuit breaker**: automatically halts trading if drawdown exceeds `MAX_DRAWDOWN_PCT`
-- **TWAP / MEV defense**: splits orders above `TWAP_THRESHOLD_USD` into randomized time-weighted chunks
-- **Dead-coin filter**: `PoolAnalyzer` rejects pools with insufficient liquidity or activity
-- **State persistence**: atomic writes with SHA-256 checksums prevent corrupt state on restart
-- **Emergency shutdown**: `touch SHUTDOWN` (or set `SHUTDOWN_SIGNAL_FILE` path) gracefully stops the agent
 
 ---
 
@@ -198,4 +204,4 @@ See [docs/configuration-reference.md](docs/configuration-reference.md) for the f
 
 MIT License — see `LICENSE` for details.
 
-> **Disclaimer:** This software is provided for educational and hackathon purposes. Live trading with real funds carries substantial risk of loss. The authors are not responsible for any financial losses incurred through use of this software.
+> **Disclaimer:** This software is provided for educational and hackathon purposes. Live trading with real funds carries substantial risk of loss. The authors are not responsible for any financial losses incurred.
