@@ -281,19 +281,31 @@ export interface TradeRecord {
   signalToTxMs: number;
 }
 
+// ─── Competition Registration ─────────────────────────────────────────────────
+
+export interface CompetitionRegistration {
+  walletAddress: string;
+  txHash:        string;
+  timestamp:     number;
+  confirmed:     boolean;
+}
+
 // ─── System State ────────────────────────────────────────────────────────────
 
 export interface SystemState {
-  version:               string;
-  openPositions:         Position[];
-  pendingTransactions:   Transaction[];
-  drawdownBaseline:      number;
-  circuitBreakerActive:  boolean;
-  emergencyShutdown:     boolean;
+  version:                  string;
+  openPositions:            Position[];
+  pendingTransactions:      Transaction[];
+  drawdownBaseline:         number;
+  circuitBreakerActive:     boolean;
+  emergencyShutdown:        boolean;
   /** Last known market regime per pair — persisted so restart doesn't have a 60s blind window */
-  lastRegimes:           Record<string, MarketRegime>;
-  savedAt:               number;
-  checksum:              string;
+  lastRegimes:              Record<string, MarketRegime>;
+  savedAt:                  number;
+  checksum:                 string;
+  competitionRegistration:  CompetitionRegistration | null;
+  /** UTC date (YYYY-MM-DD) → confirmed trade count. Resets each calendar day. */
+  dailyTrades:              Record<string, number>;
 }
 
 // ─── Performance Metrics ─────────────────────────────────────────────────────

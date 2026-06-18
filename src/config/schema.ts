@@ -105,11 +105,12 @@ const AdaptiveConfigSchema = z.object({
 export const ConfigSchema = z.object({
   // CMC_API_KEY
   cmcApiKey:         z.string().min(32),
-  // TWAK_ACCESS_ID — optional, reserved for Trust Wallet Agent Kit when SDK is published.
-  // No min() guard — empty string is the valid default when TWAK is not configured.
-  twakAccessId:      z.string().optional().default(''),
-  // TWAK_HMAC_SECRET — optional, reserved for Trust Wallet Agent Kit when SDK is published.
-  twakHmacSecret:    z.string().optional().default(''),
+  // TWAK_ACCESS_ID — Trust Wallet Agent Kit API credential
+  twakAccessId:        z.string().optional().default(''),
+  // TWAK_HMAC_SECRET — Trust Wallet Agent Kit HMAC secret
+  twakHmacSecret:      z.string().optional().default(''),
+  // TWAK_WALLET_PASSWORD — password protecting the local TWAK wallet keystore
+  twakWalletPassword:  z.string().optional().default(''),
   // TRADING_PAIRS (comma-separated)
   tradingPairs:      z.array(z.string().regex(/^[A-Z]+\/[A-Z]+$/)).min(1),
 

@@ -16,6 +16,8 @@ import { MomentumStrategy }          from './strategies/MomentumStrategy';
 import { MeanReversionStrategy }     from './strategies/MeanReversionStrategy';
 import { RangeStrategy }             from './strategies/RangeStrategy';
 import { StateManager }              from './state/StateManager';
+import { registrationGate }         from './registration/RegistrationService';
+import { isPairEligible }           from './config/eligible-tokens';
 import { AnalyticsEngine }           from './analytics/AnalyticsEngine';
 import { HealthMonitor }             from './health/HealthMonitor';
 import type {
@@ -70,6 +72,20 @@ async function bootstrap(): Promise<void> {
   const stateResult = await stateMgr.loadState();
   // Use a mutable reference so state updates are reflected everywhere
   let currentState: SystemState = stateResult.ok ? stateResult.value : stateMgr.emptyState();
+
+  // Hard gate: refuse to start in mainnet mode without a confirmed registration
+  registrationGate(cfg.network.mode, currentState);
+
+  // A3: Warn at startup if any configured pair is outside the competition eligible token list.
+  // Ineligible trades don't count toward scoring — surface this now rather than silently wasting gas.
+  for (const pair of cfg.tradingPairs) {
+    if (!isPairEligible(pair)) {
+      logger.warn('ELIGIBLE TOKEN WARNING: configured pair is not on the competition eligible list', {
+        pair,
+        action: 'trades on this pair will not count toward competition scoring',
+      });
+    }
+  }
 
   // Mutex serialises all currentState mutations to prevent concurrent write corruption
   const stateMutex = new StateMutex();
@@ -260,6 +276,23 @@ async function bootstrap(): Promise<void> {
     void handlePositionClose(positionId, price, 'take_profit');
   });
 
+  // ── [8e-A7] Drawdown breach → force-flatten all open positions ──────────────
+  // A7: on DQ-level drawdown breach, close every open position immediately
+  // rather than just blocking new entries. Positions ride out further loss
+  // between check ticks without this.
+  bus.on('risk:circuit_breaker', () => {
+    if (openPositionMap.size === 0) return;
+    logger.warn('Max drawdown breached — force-flattening all open positions', {
+      count: openPositionMap.size,
+    });
+    for (const [positionId, { position }] of openPositionMap) {
+      void (async () => {
+        const price = await tradingEngine.getCurrentPrice(position.pair).catch(() => position.entryPrice);
+        void handlePositionClose(positionId, price, 'circuit_breaker');
+      })();
+    }
+  });
+
   // ── [8e] Manual circuit breaker reset via file signal ─────────────────────
   bus.on('health:circuit_breaker_reset', () => {
     logger.info('Circuit breaker reset via file signal');
@@ -293,6 +326,16 @@ async function bootstrap(): Promise<void> {
       const posResult    = riskMgr.calculatePositionSize(portfolioUsd, signal.pair);
       if (!posResult.ok) {
         logger.warn('Signal rejected: position sizing failed', { error: posResult.error.message, portfolioUsd });
+        return;
+      }
+
+      // A6: Dust guard — never execute a trade that would leave < $1 in the portfolio.
+      // A portfolio drained to ≤ $1 counts as 0% for that hour and may disqualify.
+      const remainingAfterTrade = portfolioUsd - posResult.value;
+      if (remainingAfterTrade < 1 && portfolioUsd > 0) {
+        logger.warn('Signal rejected: trade would drain portfolio to dust', {
+          pair: signal.pair, portfolioUsd, tradeSize: posResult.value, remaining: remainingAfterTrade,
+        });
         return;
       }
 
@@ -449,7 +492,7 @@ async function bootstrap(): Promise<void> {
   async function handlePositionClose(
     positionId: string,
     exitPrice:  number,
-    reason:     'stop_loss' | 'take_profit' | 'emergency',
+    reason:     'stop_loss' | 'take_profit' | 'circuit_breaker' | 'emergency',
   ): Promise<void> {
     const entry = openPositionMap.get(positionId);
     if (!entry) return;
@@ -604,14 +647,22 @@ async function bootstrap(): Promise<void> {
       pnlPct: pnlPct.toFixed(2),
     });
 
+    // A4: Increment daily trade counter (UTC date key, persisted in state)
+    const todayUtc = new Date().toISOString().slice(0, 10);
+
     // Serialised state update — prevents race with concurrent executeSignalPipeline
     await stateMutex.run(async () => {
+      const updatedDaily = { ...currentState.dailyTrades };
+      updatedDaily[todayUtc] = (updatedDaily[todayUtc] ?? 0) + 1;
       currentState = {
         ...currentState,
         openPositions: currentState.openPositions.filter(p => p.id !== positionId),
+        dailyTrades:   updatedDaily,
       };
       await stateMgr.saveState(currentState);
     });
+
+    logger.info('Daily trade count updated', { date: todayUtc, count: currentState.dailyTrades[todayUtc] });
   }
 
   // ── [9] Banner ────────────────────────────────────────────────────────────
@@ -627,6 +678,24 @@ async function bootstrap(): Promise<void> {
     network:    cfg.network.mode,
     wallet:     executionSvc.getWalletAddress(),
   });
+
+  // ── A4: Daily trade watchdog — alert if late UTC with zero trades today ──────
+  // Competition requires ≥ 1 confirmed trade per UTC day for 7 consecutive days.
+  // Check every 30 minutes; emit health:daily_trades_warning after 22:00 UTC if count=0.
+  const dailyTradeWatchdog = setInterval(() => {
+    const now      = new Date();
+    const utcHour  = now.getUTCHours();
+    const todayKey = now.toISOString().slice(0, 10);
+    const count    = currentState.dailyTrades[todayKey] ?? 0;
+    if (utcHour >= 22 && count === 0) {
+      logger.error('DAILY TRADE ALERT: zero confirmed trades today with < 2 hours until UTC midnight', {
+        date: todayKey, utcHour,
+      });
+      bus.emit('health:daily_trades_warning', { date: todayKey, count, utcHour });
+    } else if (count === 0) {
+      logger.info('Daily trade check: no confirmed trades yet today', { date: todayKey, utcHour });
+    }
+  }, 30 * 60 * 1000);
 
   // ── Periodic state persistence ────────────────────────────────────────────
   // Saves the current state every statePersistSec seconds regardless of trade activity.
@@ -675,6 +744,7 @@ async function bootstrap(): Promise<void> {
 
       // Stop the periodic save interval first — prevents it from racing with the final save.
       clearInterval(statePersistInterval);
+      clearInterval(dailyTradeWatchdog);
 
       // ── Warn about any in-flight TWAP orders ──────────────────────────────
       if (activeTwapOrders.size > 0) {
