@@ -166,7 +166,7 @@ export class AnalyticsEngine {
     };
   }
 
-  generateReport(type: 'shutdown' | 'backtest' | 'demo'): string {
+  generateReport(type: 'shutdown' | 'backtest' | 'demo' | 'emergency'): string {
     const m = this.getMetrics();
     return [
       `=== BLOCKOUT — ${type.toUpperCase()} REPORT ===`,

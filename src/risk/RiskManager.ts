@@ -139,16 +139,28 @@ export class RiskManager {
   resetCircuitBreaker(): void {
     this.circuitBreakerActive = false;
     logger.info('Circuit breaker reset');
-    // Reset drawdown baseline to current portfolio so we measure from now
+    // Reset drawdown baseline to current portfolio so we measure from now.
+    // If getPortfolioValue fails (RPC down), log the error instead of silently
+    // leaving the baseline stale, which would immediately re-trigger the CB.
     void this.engine.getPortfolioValue().then(usd => {
       if (usd > 0) {
         this.drawdownBaseline = usd;
         logger.info('Drawdown baseline reset after circuit breaker recovery', { newBaseline: usd });
+      } else {
+        logger.warn('resetCircuitBreaker: portfolio value was 0 — baseline not updated. Will retry on next drawdown check tick.');
       }
+    }).catch((e: unknown) => {
+      logger.error('resetCircuitBreaker: failed to fetch portfolio value for baseline reset — stale baseline retained', {
+        error: String(e),
+      });
     });
   }
 
   async checkDrawdown(): Promise<void> {
+    // Do not re-trigger if circuit breaker is already active — avoids event bus flooding
+    // with duplicate risk:circuit_breaker events on every drawdown check tick.
+    if (this.circuitBreakerActive) return;
+
     const current = await this.engine.getPortfolioValue();
     // If baseline is 0 (empty wallet at startup) and funds have now arrived, set baseline
     if (this.drawdownBaseline === 0) {

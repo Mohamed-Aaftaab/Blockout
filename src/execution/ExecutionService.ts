@@ -63,6 +63,8 @@ export class ExecutionService {
     let slippage     = order.slippage;
     const maxRetries = cfg.gas.maxRetries;
 
+    // Loop: attempt 0 is the initial try; attempts 1..maxRetries are retries.
+    // Total: maxRetries + 1 attempts (e.g. maxRetries=3 → 4 total: 1 initial + 3 retries).
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         // For BSC Perpetuals: use routeOrder directly (no ERC-20 approval needed)

@@ -154,6 +154,21 @@ export class TradingEngine {
   /** Public provider access for ExecutionService receipt polling */
   getProvider(): ethers.JsonRpcProvider | null { return this.provider; }
 
+  /**
+   * Wraps any RPC call in a timeout using rpcTimeoutMs from config.
+   * Prevents a hung RPC node from stalling the SL/TP monitor or signal pipeline.
+   */
+  private withRpcTimeout<T>(call: Promise<T>): Promise<T> {
+    const cfg = this.config.get();
+    const timeoutMs = cfg.network.rpcTimeoutMs;
+    return Promise.race([
+      call,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`RPC call timed out after ${timeoutMs}ms`)), timeoutMs),
+      ),
+    ]);
+  }
+
   async routeOrder(order: Order): Promise<Result<Transaction, EngineError>> {
     try {
       let tx: Transaction;
@@ -532,7 +547,7 @@ export class TradingEngine {
 
   async getCurrentPrice(pair: string): Promise<number> {
     try {
-      const reserves = await this.getPoolReserves(pair);
+      const reserves = await this.withRpcTimeout(this.getPoolReserves(pair));
       // Use reserves.token0Symbol/token1Symbol (on-chain sorted order) not pair string order
       // because PancakeSwap sorts tokens by address when creating pairs.
       const r0 = Number(ethers.formatUnits(reserves.reserve0, getTokenDecimals(reserves.token0Symbol)));
@@ -598,7 +613,7 @@ export class TradingEngine {
     try {
       const provider = this.requireProvider();
       const erc20    = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
-      return await erc20.getFunction('balanceOf')(walletAddress) as bigint;
+      return await this.withRpcTimeout(erc20.getFunction('balanceOf')(walletAddress) as Promise<bigint>);
     } catch {
       return 0n;
     }
@@ -629,8 +644,8 @@ export class TradingEngine {
       const tokens  = TOKEN_ADDRESSES[network] ?? TOKEN_ADDRESSES['testnet']!;
       const wbnb    = tokens['WBNB'] ?? ethers.ZeroAddress;
 
-      // Native BNB balance
-      const balanceWei = await this.requireProvider().getBalance(address);
+      // Native BNB balance — wrapped in rpcTimeoutMs so a hung node doesn't stall the pipeline
+      const balanceWei = await this.withRpcTimeout(this.requireProvider().getBalance(address));
       let totalUsd     = Number(ethers.formatUnits(balanceWei, 18)) * this.bnbPriceUsd;
 
       // ERC-20 token balances for each configured pair

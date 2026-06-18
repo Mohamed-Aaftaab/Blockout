@@ -3,6 +3,7 @@ import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus } from '../events/EventBus';
 import type { CircuitState } from '../types/index';
+import type { TradingEngine } from '../execution/TradingEngine';
 
 const logger = makeLogger();
 
@@ -13,11 +14,18 @@ export class HealthMonitor {
   private startTime: number = 0;
   private shutdownTriggered: boolean = false;
   private shutdownPollInterval: NodeJS.Timeout | null = null;
+  private rpcPingInterval: NodeJS.Timeout | null = null;
   private circuitBreakerListener: (() => void) | null = null;
+  private tradingEngine: TradingEngine | null = null;
 
   constructor(config: ConfigurationService, bus: EventBus) {
     this.config = config;
     this.bus = bus;
+  }
+
+  /** Wire TradingEngine so HealthMonitor can ping RPC liveness */
+  setTradingEngine(engine: TradingEngine): void {
+    this.tradingEngine = engine;
   }
 
   start(): void {
@@ -39,6 +47,14 @@ export class HealthMonitor {
       this.pollShutdownSignal();
     }, cfg.shutdownPollMs);
 
+    // Periodic RPC liveness ping — detects dead nodes between trades.
+    // Runs every shutdownPollMs * 6 (default: every 30s). On failure, emits health:warning
+    // so the operator is alerted before the next trade attempt fails.
+    const rpcPingMs = cfg.shutdownPollMs * 6;
+    this.rpcPingInterval = setInterval(() => {
+      void this.pingRpc();
+    }, rpcPingMs);
+
     // Wire circuit state to RiskManager's circuit breaker events
     this.circuitBreakerListener = () => {
       this.circuitState = 'OPEN';
@@ -53,6 +69,10 @@ export class HealthMonitor {
     if (this.shutdownPollInterval !== null) {
       clearInterval(this.shutdownPollInterval);
       this.shutdownPollInterval = null;
+    }
+    if (this.rpcPingInterval !== null) {
+      clearInterval(this.rpcPingInterval);
+      this.rpcPingInterval = null;
     }
     if (this.circuitBreakerListener !== null) {
       this.bus.off('risk:circuit_breaker', this.circuitBreakerListener);
@@ -108,8 +128,24 @@ export class HealthMonitor {
     }, timeoutMs);
   }
 
-  async attemptRecovery(component: string): Promise<boolean> {
-    logger.info('Attempting component recovery', { component });
+  /** Periodic RPC liveness ping. Emits health:warning if the node is unreachable. */
+  private async pingRpc(): Promise<void> {
+    if (this.tradingEngine === null) return;
+    try {
+      const provider = this.tradingEngine.getProvider();
+      if (provider === null) return;
+      // getBlockNumber is the lightest possible RPC call
+      await provider.getBlockNumber();
+    } catch (e) {
+      logger.warn('RPC liveness ping failed — node may be unreachable', { error: String(e) });
+      this.bus.emit('health:warning', {
+        component: 'HealthMonitor',
+        message:   `RPC ping failed: ${String(e)}`,
+      });
+    }
+  }
+
+  async attemptRecovery(component: string): Promise<boolean> {    logger.info('Attempting component recovery', { component });
     try {
       // Stub: in production this would restart the component process/service
       await Promise.resolve();

@@ -83,18 +83,24 @@ async function bootstrap(): Promise<void> {
   // Wire BEFORE start() so the very first CMC poll pushes BNB price
   marketData.setTradingEngine(tradingEngine);
 
+  // ── [5] Health monitor — created early so checkInitTimeout works before init ──
+  const health = new HealthMonitor(configSvc, bus);
+  // Wire TradingEngine for periodic RPC liveness pings
+  health.setTradingEngine(tradingEngine);
+  health.start();
+
   // TradingEngine MUST initialise before ExecutionService — ExecutionService.initialize()
   // calls engine.setSigner() which calls requireProvider(). If both run concurrently via
   // Promise.all, executionSvc may call setSigner before the provider is connected.
   await tradingEngine.initialize();
+  // Set startup timeouts so a hung init step doesn't silently stall bootstrap.
+  // Both values are generous but bounded — well beyond normal BSC RPC latency.
+  const INIT_TIMEOUT_MS = (cfg.txTimeoutSec * 1000) * 2; // 2× tx timeout (default 240s)
+  health.checkInitTimeout('ExecutionService', INIT_TIMEOUT_MS);
   await Promise.all([
     executionSvc.initialize(),
     marketData.start(),
   ]);
-
-  // ── [5] Health monitor ────────────────────────────────────────────────────
-  const health = new HealthMonitor(configSvc, bus);
-  health.start();
 
   // ── [6] Supporting services ───────────────────────────────────────────────
   const analytics    = new AnalyticsEngine(stateMgr, configSvc, bus);
@@ -440,7 +446,7 @@ async function bootstrap(): Promise<void> {
   async function handlePositionClose(
     positionId: string,
     exitPrice:  number,
-    reason:     'stop_loss' | 'take_profit',
+    reason:     'stop_loss' | 'take_profit' | 'emergency',
   ): Promise<void> {
     const entry = openPositionMap.get(positionId);
     if (!entry) return;
@@ -637,13 +643,27 @@ async function bootstrap(): Promise<void> {
 
   // ── Graceful shutdown ─────────────────────────────────────────────────────
   let shutdownInProgress = false;
+  let shutdownReason     = '';
 
   const shutdown = async (reason: string): Promise<void> => {
-    if (shutdownInProgress) return;
-    shutdownInProgress = true;
-    logger.info('Shutting down Blockout...', { reason });
-
-    clearInterval(statePersistInterval);
+    if (shutdownInProgress) {
+      // If already shutting down via non-emergency (e.g. SIGTERM) but a file-trigger
+      // or circuit-breaker emergency now arrives, escalate to emergency close-all.
+      const isNewEmergency = reason === 'emergency' || reason === 'file-trigger';
+      const wasNonEmergency = shutdownReason !== 'emergency' && shutdownReason !== 'file-trigger';
+      if (isNewEmergency && wasNonEmergency && openPositionMap.size > 0) {
+        logger.warn('Escalating shutdown to emergency — closing all open positions', { reason });
+        shutdownReason = reason;
+        // Fall through to close-all below (shutdownInProgress already true, so skip the guard)
+      } else {
+        return;
+      }
+    } else {
+      shutdownInProgress = true;
+      shutdownReason     = reason;
+      logger.info('Shutting down Blockout...', { reason });
+      clearInterval(statePersistInterval);
+    }
 
     // ── Fix U: Warn about any in-flight TWAP orders ───────────────────────────
     // We cannot cancel on-chain transactions, but we log clearly so the operator
@@ -660,20 +680,31 @@ async function bootstrap(): Promise<void> {
       });
     }
 
-    // ── Fix V: Emergency close-all open positions ─────────────────────────────
-    // On emergency shutdown (file-trigger or circuit breaker), attempt to close
-    // all open positions before exiting. Best-effort — failures are logged but
-    // do not block the shutdown sequence.
-    const isEmergency = reason === 'emergency' || reason === 'file-trigger';
+    // ── Emergency close-all open positions ────────────────────────────────────
+    const isEmergency = shutdownReason === 'emergency' || shutdownReason === 'file-trigger';
     if (isEmergency && openPositionMap.size > 0) {
       logger.warn('Emergency shutdown — attempting to close all open positions', {
         count: openPositionMap.size,
       });
-      const closePromises = [...openPositionMap.entries()].map(async ([posId, entry]) => {
+      // Snapshot the IDs before any async work — handlePositionClose deletes from the
+      // map on entry and may re-add on retry. Processing sequentially avoids two
+      // concurrent close attempts on the same position ID.
+      const positionIds = [...openPositionMap.keys()];
+      const closeTimeout = cfg.txTimeoutSec * 1000;
+      const started = Date.now();
+      for (const posId of positionIds) {
+        if (Date.now() - started >= closeTimeout) {
+          logger.warn('Emergency close-all timeout reached — remaining positions not closed', {
+            remaining: positionIds.length,
+          });
+          break;
+        }
+        const entry = openPositionMap.get(posId);
+        if (!entry) continue; // already closed by a concurrent SL/TP tick
         try {
           const exitPrice = await tradingEngine.getCurrentPrice(entry.position.pair);
           if (exitPrice > 0) {
-            await handlePositionClose(posId, exitPrice, 'stop_loss');
+            await handlePositionClose(posId, exitPrice, 'emergency');
           } else {
             logger.warn('Cannot close position — price unavailable at shutdown', {
               positionId: posId, pair: entry.position.pair,
@@ -684,12 +715,7 @@ async function bootstrap(): Promise<void> {
             positionId: posId, error: String(e),
           });
         }
-      });
-      // Allow up to txTimeoutSec for all close operations
-      await Promise.race([
-        Promise.allSettled(closePromises),
-        new Promise<void>(resolve => setTimeout(resolve, cfg.txTimeoutSec * 1000)),
-      ]);
+      }
     }
 
     stratMgr.stop();
@@ -700,7 +726,7 @@ async function bootstrap(): Promise<void> {
     health.stop();
     tradingEngine.stop();
 
-    logger.info(analytics.generateReport('shutdown'));
+    logger.info(analytics.generateReport(isEmergency ? 'emergency' : 'shutdown'));
 
     // Final state save via mutex to avoid racing with any in-flight operations
     await stateMutex.run(async () => {
