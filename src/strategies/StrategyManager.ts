@@ -3,7 +3,6 @@ import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
 import type { TradingSignal, Order } from '../types/index';
 import type { IStrategy }            from './IStrategy';
-import type { SignalGenerator }      from '../market/SignalGenerator';
 import type { RegimeDetector }       from '../market/RegimeDetector';
 
 const logger = makeLogger();
@@ -25,7 +24,6 @@ export class StrategyManager {
   private signalListener:      ((signal: TradingSignal) => void) | null = null;
 
   constructor(
-    _signalGen:     SignalGenerator,  // kept for API compatibility — not used internally
     regimeDetector: RegimeDetector,
     config:         ConfigurationService,
     bus:            EventBus,

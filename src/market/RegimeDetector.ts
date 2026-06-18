@@ -49,6 +49,28 @@ export class RegimeDetector {
     return this.currentRegimes.get(pair) ?? 'sideways';
   }
 
+  /** Restore regime map from persisted state on restart to avoid the 60s blind window */
+  restoreRegimes(regimes: Record<string, MarketRegime>): void {
+    for (const [pair, regime] of Object.entries(regimes)) {
+      this.currentRegimes.set(pair, regime);
+    }
+    if (Object.keys(regimes).length > 0) {
+      const entries = Object.entries(regimes)
+        .map(([p, r]) => `${p}=${r}`)
+        .join(', ');
+      logger.info('Market regimes restored from persisted state', { regimes: entries });
+    }
+  }
+
+  /** Snapshot the current regime map for state persistence */
+  getRegimes(): Record<string, MarketRegime> {
+    const result: Record<string, MarketRegime> = {};
+    for (const [pair, regime] of this.currentRegimes) {
+      result[pair] = regime;
+    }
+    return result;
+  }
+
   detectRegime(pair: string, data: MarketData): MarketRegime {
     const cfg = this.config.get().regime;
     const ind = data.indicators;
@@ -59,6 +81,10 @@ export class RegimeDetector {
 
     // Sideways: BB width below threshold
     if (ind.bbWidth < cfg.bbWidthThreshold) return 'sideways';
+
+    // Guard: if ma50 is 0 (CMC indicators unavailable), we cannot reliably classify
+    // bull or bear — fall back to sideways rather than misclassifying based on price > 0.
+    if (ind.ma50 === 0) return 'sideways';
 
     // Bull: MA20 sloping up and price above MA50
     if (ma20Slope > cfg.slopeUpThreshold && data.price > ind.ma50) return 'bull';

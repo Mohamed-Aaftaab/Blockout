@@ -290,6 +290,8 @@ export interface SystemState {
   drawdownBaseline:      number;
   circuitBreakerActive:  boolean;
   emergencyShutdown:     boolean;
+  /** Last known market regime per pair — persisted so restart doesn't have a 60s blind window */
+  lastRegimes:           Record<string, MarketRegime>;
   savedAt:               number;
   checksum:              string;
 }

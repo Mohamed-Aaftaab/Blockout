@@ -47,13 +47,14 @@ const TransactionSchema: z.ZodType<Transaction> = z.object({
   to:             z.string(),
 }) as z.ZodType<Transaction>;
 
-const SystemStateSchema: z.ZodType<SystemState> = z.object({
+const SystemStateSchema = z.object({
   version:              z.string(),
   openPositions:        z.array(PositionSchema),
   pendingTransactions:  z.array(TransactionSchema),
   drawdownBaseline:     z.number(),
   circuitBreakerActive: z.boolean(),
   emergencyShutdown:    z.boolean(),
+  lastRegimes:          z.record(z.enum(['bull', 'bear', 'sideways'])).default({}),
   savedAt:              z.number(),
   checksum:             z.string(),
 });
@@ -211,6 +212,7 @@ export class StateManager {
       drawdownBaseline:     0,
       circuitBreakerActive: false,
       emergencyShutdown:    false,
+      lastRegimes:          {},
       savedAt:              Date.now(),
     };
     const checksum = this.computeChecksum(blank);

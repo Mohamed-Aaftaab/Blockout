@@ -25,6 +25,16 @@ import { uuid } from './utils/uuid';
 
 const logger = makeLogger();
 
+// ── Global unhandled rejection guard ─────────────────────────────────────────
+// Fire-and-forget async paths (executeSignalPipeline, handlePositionClose, intervals)
+// can throw errors that escape their own try/catch. Without this handler, Node.js
+// only prints a deprecation warning and the agent silently continues in a broken state.
+process.on('unhandledRejection', (reason: unknown) => {
+  logger.error('Unhandled promise rejection — agent may be in degraded state', {
+    reason: String(reason),
+  });
+});
+
 /**
  * Lightweight async mutex — ensures sequential state saves.
  * Prevents race conditions when open and close operations overlap.
@@ -98,6 +108,12 @@ async function bootstrap(): Promise<void> {
   regimeDet.start();
   await riskMgr.start();
 
+  // Restore persisted regime map so strategies fire correctly immediately on restart
+  // without waiting up to dataRefreshSec (default 60s) for the first CMC poll.
+  if (Object.keys(currentState.lastRegimes).length > 0) {
+    regimeDet.restoreRegimes(currentState.lastRegimes);
+  }
+
   // Restore persisted drawdown baseline ONLY when start() found an empty wallet (baseline=0).
   // If the wallet is funded, start() already set the correct live baseline — don't overwrite it
   // with a potentially stale persisted value that would trigger a false drawdown alarm.
@@ -120,6 +136,11 @@ async function bootstrap(): Promise<void> {
 
   // ── Concurrency guard: one pipeline execution per pair at a time ──────────
   const pipelineInProgress = new Set<string>();
+
+  // ── Active TWAP tracker — tracks orders currently mid-TWAP execution ─────
+  // Key: orderId, Value: pair. Used at shutdown to drain partial fills and
+  // to record the position even when only some chunks succeed before a crash.
+  const activeTwapOrders = new Map<string, string>();
 
   // ── [7] Recover open positions from persisted state ───────────────────────
   for (const position of currentState.openPositions) {
@@ -149,7 +170,7 @@ async function bootstrap(): Promise<void> {
   }
 
   // ── [8] Strategies ────────────────────────────────────────────────────────
-  const stratMgr  = new StrategyManager(signalGen, regimeDet, configSvc, bus);
+  const stratMgr  = new StrategyManager(regimeDet, configSvc, bus);
   const midBattle = new MidBattleScalpingStrategy(configSvc, bus);
   const momentum  = new MomentumStrategy(configSvc, bus);
   const meanRev   = new MeanReversionStrategy(configSvc, bus);
@@ -240,6 +261,7 @@ async function bootstrap(): Promise<void> {
         ...currentState,
         drawdownBaseline:     riskMgr.getDrawdownBaseline(),
         circuitBreakerActive: false,
+        lastRegimes:          regimeDet.getRegimes(),
       });
     });
   });
@@ -294,14 +316,40 @@ async function bootstrap(): Promise<void> {
           chunks:  cfg.twap.chunkCount,
         });
         const twapPlan = mevModule.buildTwapPlan(validOrder);
-        txResults = await mevModule.executeTwap(
-          validOrder,
-          twapPlan,
-          (chunk) => executionSvc.executeChunk(chunk, 0).then(r => {
-            if (!r.ok) throw r.error;
-            return r.value;
-          }),
-        );
+        // Register the TWAP order so shutdown can detect it is in-flight
+        activeTwapOrders.set(validOrder.id, signal.pair);
+        try {
+          txResults = await mevModule.executeTwap(
+            validOrder,
+            twapPlan,
+            (chunk) => executionSvc.executeChunk(chunk, 0).then(r => {
+              if (!r.ok) throw r.error;
+              return r.value;
+            }),
+          );
+        } catch (twapErr) {
+          // One or more TWAP chunks failed. If any chunks succeeded, the wallet
+          // already received tokens for those chunks but no position is tracked.
+          // Record a synthetic zero-size position as a sentinel so we don't lose
+          // the trade from analytics, and emit a critical alert for manual review.
+          const completedChunks = twapPlan.chunksDone;
+          if (completedChunks > 0) {
+            logger.error('TWAP partial fill — some chunks succeeded before failure', {
+              orderId: validOrder.id, pair: signal.pair,
+              completedChunks, totalChunks: twapPlan.chunksTotal,
+            });
+            bus.emit('health:critical', {
+              component: 'executeSignalPipeline',
+              message:   `TWAP partial fill for ${validOrder.id}: ${completedChunks}/${twapPlan.chunksTotal} chunks ` +
+                         `submitted. Wallet has untracked tokens — manual review required.`,
+              timestamp: Date.now(),
+            });
+          }
+          activeTwapOrders.delete(validOrder.id);
+          logger.error('TWAP execution failed', { orderId: validOrder.id, error: String(twapErr) });
+          return;
+        }
+        activeTwapOrders.delete(validOrder.id);
       } else {
         const execResult = await executionSvc.executeOrder(validOrder);
         if (!execResult.ok) {
@@ -398,12 +446,16 @@ async function bootstrap(): Promise<void> {
     if (!entry) return;
 
     const { position, signal, openedAt, closeRetries } = entry;
+    // Remove from openPositionMap immediately so duplicate SL/TP events for the same
+    // position don't each try to close it concurrently.
     openPositionMap.delete(positionId);
-    riskMgr.onPositionClosed(positionId);
+    // NOTE: Do NOT call riskMgr.onPositionClosed() yet — we call it only after we
+    // confirm we are NOT retrying, so the position is never absent from the risk
+    // manager's exposure tracking during the window between this check and the close
+    // order. This closes the gap (Fix C/E) where checkDrawdown() could see a
+    // temporarily lower exposure and allow a new position to breach max exposure.
 
     // ── Balance cap: prevent on-chain reverts from partial fills ──────────────
-    // For buy positions (closing = sell base token): check ERC-20 balance.
-    // For sell positions (closing = buy back using quote token): check quote balance.
     let closeSize = position.size;
     if (position.side === 'buy') {
       const actualBalance = await executionSvc.getBaseTokenBalance(position.pair);
@@ -429,16 +481,16 @@ async function bootstrap(): Promise<void> {
     // If token balance is effectively zero (already moved or lost), record a zero-pnl trade
     if (closeSize <= 0) {
       logger.warn('Close size is zero — skipping close order (tokens no longer in wallet)', { positionId });
-      // Still record the real price movement % so metrics reflect the actual market outcome
-      const zeroPnlUsd = 0; // no tokens to sell = $0 recovered
       const realPnlPct = position.side === 'buy'
         ? (exitPrice - position.entryPrice) / position.entryPrice * 100
         : (position.entryPrice - exitPrice) / position.entryPrice * 100;
       const tradeRecord: TradeRecord = {
         id: uuid(), position, closePrice: exitPrice, closedAt: Date.now(),
-        exitReason: reason, pnlUsd: zeroPnlUsd, pnlPct: realPnlPct,
+        exitReason: reason, pnlUsd: 0, pnlPct: realPnlPct,
         holdMs: Date.now() - openedAt, transactions: [], signalToTxMs: 0,
       };
+      // Position is gone (zero balance) — remove from risk manager and record
+      riskMgr.onPositionClosed(positionId);
       analytics.recordTrade(tradeRecord);
       await stateMutex.run(async () => {
         currentState = { ...currentState, openPositions: currentState.openPositions.filter(p => p.id !== positionId) };
@@ -476,13 +528,13 @@ async function bootstrap(): Promise<void> {
           message:   `Position ${positionId} stuck after ${maxRetries} close attempts: ${execResult.error.message}`,
           timestamp: Date.now(),
         });
-        // No actual sale occurred — record zero PnL so metrics are not inflated
-        // with estimated values for a trade that never executed on-chain.
+        // No actual sale occurred — record zero PnL
         const tradeRecordFailed: TradeRecord = {
           id: uuid(), position, closePrice: exitPrice, closedAt: Date.now(),
           exitReason: reason, pnlUsd: 0, pnlPct: 0,
           holdMs: Date.now() - openedAt, transactions: [], signalToTxMs: 0,
         };
+        riskMgr.onPositionClosed(positionId);
         analytics.recordTrade(tradeRecordFailed);
         await stateMutex.run(async () => {
           currentState = { ...currentState, openPositions: currentState.openPositions.filter(p => p.id !== positionId) };
@@ -493,8 +545,10 @@ async function bootstrap(): Promise<void> {
         logger.error('Close order failed — restoring position for SL/TP retry', {
           positionId, pair: position.pair, reason, retries: newRetries, error: execResult.error.message,
         });
+        // Put the position back in openPositionMap for the next SL/TP monitor tick.
+        // We did NOT call onPositionClosed() yet, so risk manager exposure is still
+        // correct — no gap where checkDrawdown() under-counts exposure.
         openPositionMap.set(positionId, { position, signal, openedAt, closeRetries: newRetries });
-        riskMgr.onPositionOpened(position);
         bus.emit('health:warning', {
           component: 'handlePositionClose',
           message:   `Close attempt ${newRetries}/${maxRetries} failed for ${positionId}: ${execResult.error.message}`,
@@ -503,10 +557,12 @@ async function bootstrap(): Promise<void> {
       }
     }
 
+    // Close succeeded — now remove from risk manager
+    riskMgr.onPositionClosed(positionId);
+
     const closeTxs = [execResult.value];
 
     // PnL calculation — use closeSize (what was actually closed) not position.size
-    // (which may have been capped by partial fill balance check above).
     const pnlUsd = position.side === 'buy'
       ? (exitPrice - position.entryPrice) / position.entryPrice * closeSize
       : (position.entryPrice - exitPrice) / position.entryPrice * closeSize;
@@ -569,11 +625,12 @@ async function bootstrap(): Promise<void> {
   // even during quiet periods when no positions open or close.
   const statePersistInterval = setInterval(() => {
     void stateMutex.run(async () => {
-      // Sync both drawdown baseline and circuit breaker state from RiskManager
+      // Sync drawdown baseline, circuit breaker, and regime map from live components
       await stateMgr.saveState({
         ...currentState,
         drawdownBaseline:     riskMgr.getDrawdownBaseline(),
         circuitBreakerActive: riskMgr.getCircuitBreakerActive(),
+        lastRegimes:          regimeDet.getRegimes(),
       });
     });
   }, cfg.statePersistSec * 1000);
@@ -587,6 +644,54 @@ async function bootstrap(): Promise<void> {
     logger.info('Shutting down Blockout...', { reason });
 
     clearInterval(statePersistInterval);
+
+    // ── Fix U: Warn about any in-flight TWAP orders ───────────────────────────
+    // We cannot cancel on-chain transactions, but we log clearly so the operator
+    // knows to check their wallet for any partial fills.
+    if (activeTwapOrders.size > 0) {
+      logger.error('Shutdown requested while TWAP orders are in-flight — wallet may have untracked partial fills', {
+        activeTwapOrders: Object.fromEntries(activeTwapOrders),
+      });
+      bus.emit('health:critical', {
+        component: 'shutdown',
+        message:   `Shutdown with ${activeTwapOrders.size} active TWAP order(s). ` +
+                   `Check wallet for untracked tokens: ${[...activeTwapOrders.values()].join(', ')}`,
+        timestamp: Date.now(),
+      });
+    }
+
+    // ── Fix V: Emergency close-all open positions ─────────────────────────────
+    // On emergency shutdown (file-trigger or circuit breaker), attempt to close
+    // all open positions before exiting. Best-effort — failures are logged but
+    // do not block the shutdown sequence.
+    const isEmergency = reason === 'emergency' || reason === 'file-trigger';
+    if (isEmergency && openPositionMap.size > 0) {
+      logger.warn('Emergency shutdown — attempting to close all open positions', {
+        count: openPositionMap.size,
+      });
+      const closePromises = [...openPositionMap.entries()].map(async ([posId, entry]) => {
+        try {
+          const exitPrice = await tradingEngine.getCurrentPrice(entry.position.pair);
+          if (exitPrice > 0) {
+            await handlePositionClose(posId, exitPrice, 'stop_loss');
+          } else {
+            logger.warn('Cannot close position — price unavailable at shutdown', {
+              positionId: posId, pair: entry.position.pair,
+            });
+          }
+        } catch (e) {
+          logger.error('Failed to close position during emergency shutdown', {
+            positionId: posId, error: String(e),
+          });
+        }
+      });
+      // Allow up to txTimeoutSec for all close operations
+      await Promise.race([
+        Promise.allSettled(closePromises),
+        new Promise<void>(resolve => setTimeout(resolve, cfg.txTimeoutSec * 1000)),
+      ]);
+    }
+
     stratMgr.stop();
     riskMgr.stop();
     analytics.stop();
@@ -605,7 +710,8 @@ async function bootstrap(): Promise<void> {
         circuitBreakerActive: riskMgr.getCircuitBreakerActive(),
         openPositions:        currentState.openPositions,
         pendingTransactions:  [],
-        emergencyShutdown:    reason === 'emergency' || reason === 'file-trigger',
+        emergencyShutdown:    isEmergency,
+        lastRegimes:          regimeDet.getRegimes(),
       });
     });
 

@@ -85,6 +85,8 @@ export class HealthMonitor {
     const cfg = this.config.get();
     if (fs.existsSync(cfg.shutdownSignalFile)) {
       logger.warn('Shutdown signal file detected', { file: cfg.shutdownSignalFile });
+      // Unlink immediately so subsequent polls don't re-trigger while shutdown is in progress
+      fs.promises.unlink(cfg.shutdownSignalFile).catch(() => undefined);
       void this.triggerEmergencyShutdown('file-trigger');
     }
     // Check for circuit breaker reset signal

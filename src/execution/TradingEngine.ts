@@ -669,15 +669,26 @@ export class TradingEngine {
     let backoffMs   = cfg.network.rpcBackoffBase * 1000;
     const from      = endpoints[this.currentRpcIndex] ?? 'unknown';
 
-    for (let i = this.currentRpcIndex + 1; i < endpoints.length; i++) {
+    // Start from the next index after current. When all endpoints are exhausted,
+    // wrap around from index 0 so the agent can recover if a previously-failed
+    // RPC comes back up on the next call. Without wrapping, currentRpcIndex stays
+    // past the end of the array and no endpoint is ever tried again.
+    const startFrom = this.currentRpcIndex + 1;
+    const candidateIndices: number[] = [];
+    for (let i = startFrom; i < endpoints.length; i++) candidateIndices.push(i);
+    // Wrap: also try indices 0..currentRpcIndex-1 so recovery is possible
+    for (let i = 0; i < this.currentRpcIndex; i++) candidateIndices.push(i);
+
+    for (const i of candidateIndices) {
       await sleep(backoffMs);
       backoffMs = Math.min(backoffMs * 2, cfg.network.rpcBackoffMax * 1000);
       const endpoint = endpoints[i];
       if (endpoint === undefined) continue;
       try {
-        const candidate  = new ethers.JsonRpcProvider(endpoint);
+        const candidate   = new ethers.JsonRpcProvider(endpoint);
         const blockNumber = await candidate.getBlockNumber();
-        this.provider     = candidate;
+        this.provider         = candidate;
+        // Re-connect wallet to the new provider so subsequent signs use it
         if (this.wallet) this.wallet = this.wallet.connect(candidate);
         this.currentRpcIndex = i;
         this.bus.emit('engine:rpc_failover', { from, to: endpoint, blockNumber });
@@ -694,6 +705,8 @@ export class TradingEngine {
 
   stop(): void {
     if (this.provider !== null) { this.provider.destroy(); this.provider = null; }
+    // Null wallet so stale provider reference cannot be used after stop()
+    this.wallet = null;
   }
 
   getWallet(): ethers.Wallet | null { return this.wallet; }

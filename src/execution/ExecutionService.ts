@@ -171,8 +171,7 @@ export class ExecutionService {
     const pollMs   = 2000;
 
     while (Date.now() - start < timeoutMs) {
-      await sleep(pollMs);
-
+      // Poll first, then sleep — avoids an unnecessary 2s wait for fast confirmations
       try {
         if (provider !== null) {
           const receipt = await provider.getTransactionReceipt(txHash);
@@ -225,6 +224,8 @@ export class ExecutionService {
       } catch {
         // Transient poll error — keep retrying until timeout
       }
+
+      await sleep(pollMs);
     }
 
     return err(new ExecutionError(`Transaction ${txHash} confirmation timeout after ${timeoutMs}ms`, '', 'rpc'));
@@ -267,6 +268,7 @@ export class ExecutionService {
 
   // Sends a raw transaction (approve or swap) and returns the tx hash.
   // Serialises via nonceLock so concurrent pair executions never share the same nonce.
+  // Has a per-call timeout (cfg.txTimeoutSec) so a hung RPC never stalls the nonce queue.
   private async sendRawTx(
     to:       string,
     calldata: string,
@@ -277,6 +279,9 @@ export class ExecutionService {
     if (!this.wallet) throw new Error('Wallet not initialized');
     const provider = this.engine.getProvider();
     if (!provider) throw new Error('Provider not initialized');
+
+    const cfg = this.config.get();
+    const timeoutMs = cfg.txTimeoutSec * 1000;
 
     // Queue through the nonce lock so two concurrent sendRawTx calls never receive
     // the same pending nonce. The lock is released after the transaction is submitted
@@ -290,7 +295,18 @@ export class ExecutionService {
       const signer      = this.wallet.connect(provider);
       const gasPriceWei = ethers.parseUnits(gasPrice.toFixed(9), 'gwei');
       const nonce       = await signer.getNonce('pending');
-      const sentTx      = await signer.sendTransaction({ to, data: calldata, value, gasPrice: gasPriceWei, gasLimit, nonce });
+
+      // Wrap sendTransaction in a race against a timeout so a hung RPC node
+      // never permanently stalls the nonce lock. Without this, a sendTransaction
+      // that hangs (no response, no error) keeps resolveNonce() from ever being
+      // called, blocking all subsequent transactions indefinitely.
+      const sentTx = await Promise.race([
+        signer.sendTransaction({ to, data: calldata, value, gasPrice: gasPriceWei, gasLimit, nonce }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`sendTransaction timeout after ${timeoutMs}ms`)), timeoutMs),
+        ),
+      ]);
+
       return sentTx.hash;
     } finally {
       resolveNonce();

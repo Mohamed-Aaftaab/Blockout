@@ -343,7 +343,7 @@ describe('P12 -- Strategy Weight Normalization', () => {
         fc.array(fc.double({ min: 0.01, max: 1, noNaN: true, noDefaultInfinity: true }), { minLength: 1, maxLength: 8 }),
         (initialWeights) => {
           const config = makeConfig(undefined, undefined, undefined, undefined, undefined, { enabled: true, evaluationPeriodSec: 86400, weightAdjPct: 10, benchmarkReturn: 0 });
-          const manager = new StrategyManager({}, {}, config, makeBus());
+          const manager = new StrategyManager({} as never, config, makeBus());
           initialWeights.forEach((w, i) => {
             manager.registerStrategy({ name: `strategy-${i}`, weight: w, isActive: true, supportedRegimes: ['bull', 'bear', 'sideways'], onSignal: jest.fn().mockReturnValue(null), onMarketData: jest.fn() });
           });
