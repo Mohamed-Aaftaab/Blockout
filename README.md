@@ -2,7 +2,7 @@
 
 **Autonomous AI Trading Agent — BNB Hack: AI Trading Agent Edition 2026**
 
-Blockout is a production-grade autonomous AI trading agent for BNB Smart Chain. It **blocks out MEV bots** using the Anaconda Squeeze TWAP strategy, streams live intelligence from CoinMarketCap, signs and submits on-chain transactions through a persistent self-custody ethers wallet, and executes trades on PancakeSwap V2 — all without any human in the loop.
+Blockout is a production-grade autonomous AI trading agent for BNB Smart Chain. It **blocks out MEV bots** using the Anaconda Squeeze TWAP strategy, streams live intelligence from CoinMarketCap, signs and submits on-chain transactions via the `twak` CLI (Trust Wallet Agent Kit), and executes trades on PancakeSwap and BSC Perpetuals — all without any human in the loop.
 
 ---
 
@@ -29,9 +29,24 @@ The agent is resilient to indicator endpoint unavailability — if the `/v3` end
 
 ### Trust Wallet Agent Kit (TWAK)
 
-The agent implements the Trust Wallet Agent Kit integration contract in `src/execution/TWAKAdapter.ts`. The TWAK credentials (`TWAK_ACCESS_ID`, `TWAK_HMAC_SECRET`) are pre-loaded and validated but TWAK is currently in pre-release. The agent uses an equivalent self-custody ethers.Wallet with the same security model — keys never leave the device.
+`@trustwallet/agent-sdk` is not yet published on npm (verified 2026-06-18). The `twak` CLI was not on PATH at build time.
 
-When the TWAK SDK publishes to npm, switching is a one-file change in `ExecutionService.loadOrCreateWallet()`.
+`src/execution/TWAKAdapter.ts` wraps the `twak` binary via `child_process.execFile`. It calls:
+- `twak --version` to confirm the CLI is available at `initialize()` time
+- `twak wallet address` to retrieve the agent wallet address
+- `twak sign --raw <unsignedTxHex>` to sign each transaction before broadcasting
+
+`ExecutionService.initialize()` calls `TWAKAdapter.initialize()` and **fails loudly** — emitting `health:critical` and throwing — if `twak` is not on PATH. There is no silent fallback to a local key.
+
+**To activate:** install the TWAK CLI and configure your credentials:
+```bash
+curl -fsSL https://agent-kit.trustwallet.com/install.sh | bash
+# Then verify: twak wallet address
+```
+
+`TWAK_ACCESS_ID` and `TWAK_HMAC_SECRET` are validated by `ConfigurationService` but currently optional (empty string is accepted) since the CLI handles authentication independently.
+
+> **Security note:** Never commit `.env` to source control. The `.gitignore` excludes it by default.
 
 ---
 
