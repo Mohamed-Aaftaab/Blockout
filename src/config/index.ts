@@ -111,7 +111,7 @@ export class ConfigurationService {
         rsiOverbought:        parseNumEnv(process.env['RSI_OVERBOUGHT']),
         whaleBuyThresholdUsd: undefined,
         exchangeInflowUsd:    undefined,
-        weights:              undefined,
+        weights:              {}, // Zod applies sub-schema defaults when an empty object is passed
       },
 
       scalping: {
