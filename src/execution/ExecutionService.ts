@@ -21,6 +21,11 @@ export class ExecutionService {
   private readonly config:       ConfigurationService;
   private readonly bus:          EventBus;
   private wallet:                ethers.Wallet | null = null;
+  /**
+   * Nonce lock: serialises sendRawTx calls from the same wallet so concurrent
+   * pair executions don't fetch the same pending nonce and collide on-chain.
+   */
+  private nonceLock: Promise<void> = Promise.resolve();
 
   constructor(
     tradingEngine: TradingEngine,
@@ -261,7 +266,7 @@ export class ExecutionService {
   }
 
   // Sends a raw transaction (approve or swap) and returns the tx hash.
-  // Uses explicit pending nonce to prevent collisions when two pairs execute concurrently.
+  // Serialises via nonceLock so concurrent pair executions never share the same nonce.
   private async sendRawTx(
     to:       string,
     calldata: string,
@@ -272,14 +277,24 @@ export class ExecutionService {
     if (!this.wallet) throw new Error('Wallet not initialized');
     const provider = this.engine.getProvider();
     if (!provider) throw new Error('Provider not initialized');
-    const signer      = this.wallet.connect(provider);
-    const gasPriceWei = ethers.parseUnits(gasPrice.toFixed(9), 'gwei');
-    // Explicitly fetch the pending nonce so concurrent transactions from different
-    // pairs don't collide. ethers auto-manages nonces within a single instance but
-    // explicit pending nonce is more robust under high-frequency scenarios.
-    const nonce  = await signer.getNonce('pending');
-    const sentTx = await signer.sendTransaction({ to, data: calldata, value, gasPrice: gasPriceWei, gasLimit, nonce });
-    return sentTx.hash;
+
+    // Queue through the nonce lock so two concurrent sendRawTx calls never receive
+    // the same pending nonce. The lock is released after the transaction is submitted
+    // (not after confirmation) to keep throughput reasonable.
+    let resolveNonce!: () => void;
+    const prev = this.nonceLock;
+    this.nonceLock = new Promise(res => { resolveNonce = res; });
+
+    try {
+      await prev; // wait for any in-flight send to finish fetching + using its nonce
+      const signer      = this.wallet.connect(provider);
+      const gasPriceWei = ethers.parseUnits(gasPrice.toFixed(9), 'gwei');
+      const nonce       = await signer.getNonce('pending');
+      const sentTx      = await signer.sendTransaction({ to, data: calldata, value, gasPrice: gasPriceWei, gasLimit, nonce });
+      return sentTx.hash;
+    } finally {
+      resolveNonce();
+    }
   }
 
   private async loadOrCreateWallet(): Promise<ethers.Wallet> {

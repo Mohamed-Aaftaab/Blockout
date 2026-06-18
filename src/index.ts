@@ -64,7 +64,7 @@ async function bootstrap(): Promise<void> {
   // Mutex serialises all currentState mutations to prevent concurrent write corruption
   const stateMutex = new StateMutex();
 
-  // ── [4] Parallel SDK init ─────────────────────────────────────────────────
+  // ── [4] SDK init — sequential for engine first, then parallel for I/O ─────
   const tradingEngine = new TradingEngine(configSvc, bus);
   const gasOptimizer  = new GasOptimizer(tradingEngine, configSvc);
   const executionSvc  = new ExecutionService(tradingEngine, gasOptimizer, configSvc, bus);
@@ -73,8 +73,11 @@ async function bootstrap(): Promise<void> {
   // Wire BEFORE start() so the very first CMC poll pushes BNB price
   marketData.setTradingEngine(tradingEngine);
 
+  // TradingEngine MUST initialise before ExecutionService — ExecutionService.initialize()
+  // calls engine.setSigner() which calls requireProvider(). If both run concurrently via
+  // Promise.all, executionSvc may call setSigner before the provider is connected.
+  await tradingEngine.initialize();
   await Promise.all([
-    tradingEngine.initialize(),
     executionSvc.initialize(),
     marketData.start(),
   ]);

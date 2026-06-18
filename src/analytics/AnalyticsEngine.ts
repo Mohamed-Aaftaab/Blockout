@@ -40,7 +40,7 @@ export class AnalyticsEngine {
         ? this.latencies.reduce((a, b) => a + b, 0) / this.latencies.length
         : 0;
       logger.info('Latency stats', { avgMs: avg.toFixed(1), p95Ms: p95.toFixed(1), samples: this.latencies.length });
-    }, 3600 * 1000);
+    }, cfg.metricsCalcSec * 1000);  // log at same frequency as metrics calculation
   }
 
   stop(): void {

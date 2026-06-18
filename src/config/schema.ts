@@ -50,7 +50,9 @@ const RegimeConfigSchema = z.object({
   longMaPeriod:       z.number().int().min(10).max(200).default(50),
   slopeUpThreshold:   z.number().min(0).max(1).default(0.001),
   slopeDownThreshold: z.number().min(0).max(1).default(0.001),
-  bbWidthThreshold:   z.number().min(0.01).max(50).default(5),
+  // bbWidthThreshold: default 5 would mean `bbWidth < 5` which is false when indicators
+  // default to bbWidth=5. Using 6 ensures sideways is detected on neutral/default data.
+  bbWidthThreshold:   z.number().min(0.01).max(50).default(6),
   updateIntervalSec:  z.number().int().min(60).max(3600).default(300),
 });
 

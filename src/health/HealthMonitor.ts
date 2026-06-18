@@ -90,8 +90,8 @@ export class HealthMonitor {
       logger.info('Circuit breaker reset file detected — resetting circuit breaker', {
         file: cfg.resetCircuitBreakerFile,
       });
-      // Remove the reset file first so we don't re-trigger next poll
-      try { fs.unlinkSync(cfg.resetCircuitBreakerFile); } catch { /* ignore */ }
+      // Remove the reset file asynchronously so we don't re-trigger next poll
+      fs.promises.unlink(cfg.resetCircuitBreakerFile).catch(() => undefined);
       this.bus.emit('health:circuit_breaker_reset', { timestamp: Date.now() });
     }
   }

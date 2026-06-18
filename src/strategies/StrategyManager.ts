@@ -17,7 +17,6 @@ interface StrategyOrderPair {
 }
 
 export class StrategyManager {
-  private readonly signalGen:  SignalGenerator;
   private readonly regime:     RegimeDetector;
   private readonly config:     ConfigurationService;
   private readonly bus:        EventBus;
@@ -26,12 +25,11 @@ export class StrategyManager {
   private signalListener:      ((signal: TradingSignal) => void) | null = null;
 
   constructor(
-    signalGen:      SignalGenerator,
+    _signalGen:     SignalGenerator,  // kept for API compatibility — not used internally
     regimeDetector: RegimeDetector,
     config:         ConfigurationService,
     bus:            EventBus,
   ) {
-    this.signalGen = signalGen;
     this.regime    = regimeDetector;
     this.config    = config;
     this.bus       = bus;
