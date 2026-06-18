@@ -1,6 +1,4 @@
 import { ethers } from 'ethers';
-import * as fs    from 'fs';
-import * as path  from 'path';
 import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
@@ -9,9 +7,8 @@ import { ok, err }                   from '../types/index';
 import { ExecutionError }            from '../types/errors';
 import type { TradingEngine }        from './TradingEngine';
 import type { GasOptimizer }         from './GasOptimizer';
+import { TWAKAdapter }               from './TWAKAdapter';
 import { sleep }                     from '../utils/sleep';
-
-const WALLET_KEY_FILE = './data/wallet.key';
 
 const logger = makeLogger();
 
@@ -20,10 +17,10 @@ export class ExecutionService {
   private readonly gasOptimizer: GasOptimizer;
   private readonly config:       ConfigurationService;
   private readonly bus:          EventBus;
-  private wallet:                ethers.Wallet | null = null;
+  private twakAdapter:           TWAKAdapter | null = null;
   /**
-   * Nonce lock: serialises sendRawTx calls from the same wallet so concurrent
-   * pair executions don't fetch the same pending nonce and collide on-chain.
+   * Nonce lock: serialises sendRawTx calls so concurrent pair executions
+   * never fetch the same pending nonce and collide on-chain.
    */
   private nonceLock: Promise<void> = Promise.resolve();
 
@@ -40,15 +37,14 @@ export class ExecutionService {
   }
 
   async initialize(): Promise<void> {
-    const cfg = this.config.get();
+    const cfg     = this.config.get();
+    const adapter = new TWAKAdapter();
     try {
-      const wallet = await this.loadOrCreateWallet();
-      this.wallet  = wallet;
-      this.engine.setSigner(wallet);
-      logger.info('ExecutionService initialized', {
-        address: wallet.address,
+      await adapter.initialize();
+      this.twakAdapter = adapter;
+      logger.info('ExecutionService initialized via TWAK', {
+        address: adapter.getAddress(),
         network: cfg.network.mode,
-        mode:    'self-custody (persistent ethers wallet)',
       });
     } catch (e) {
       const msg = `ExecutionService initialization failed: ${String(e)}`;
@@ -234,12 +230,12 @@ export class ExecutionService {
   }
 
   getWalletAddress(): string {
-    return this.wallet?.address ?? ethers.ZeroAddress;
+    return this.twakAdapter?.getAddress() ?? ethers.ZeroAddress;
   }
 
   async getPortfolioUsd(): Promise<number> {
-    if (!this.wallet) return 0;
-    return this.engine.getPortfolioValue(this.wallet.address);
+    if (!this.twakAdapter) return 0;
+    return this.engine.getPortfolioValue(this.twakAdapter.getAddress());
   }
 
   /**
@@ -248,11 +244,11 @@ export class ExecutionService {
    * Returns null if the token is native BNB (no ERC-20 balance to check).
    */
   async getBaseTokenBalance(pair: string): Promise<number | null> {
-    if (!this.wallet) return null;
+    if (!this.twakAdapter) return null;
     const [baseSymbol] = pair.split('/');
     if (!baseSymbol) return null;
     if (baseSymbol === 'BNB' || baseSymbol === 'WBNB') return null;
-    const balanceUsd = await this.engine.getBaseTokenBalanceUsd(baseSymbol, this.wallet.address);
+    const balanceUsd = await this.engine.getBaseTokenBalanceUsd(baseSymbol, this.twakAdapter.getAddress());
     return balanceUsd;
   }
 
@@ -261,10 +257,10 @@ export class ExecutionService {
    * Used before issuing a buy-to-close on a sell position to prevent reverts.
    */
   async getQuoteTokenBalance(pair: string): Promise<number | null> {
-    if (!this.wallet) return null;
+    if (!this.twakAdapter) return null;
     const [, quoteSymbol] = pair.split('/');
     if (!quoteSymbol || quoteSymbol === 'BNB' || quoteSymbol === 'WBNB') return null;
-    const balanceUsd = await this.engine.getBaseTokenBalanceUsd(quoteSymbol, this.wallet.address);
+    const balanceUsd = await this.engine.getBaseTokenBalanceUsd(quoteSymbol, this.twakAdapter.getAddress());
     return balanceUsd;
   }
 
@@ -278,7 +274,7 @@ export class ExecutionService {
     gasPrice: number,
     gasLimit: number,
   ): Promise<string> {
-    if (!this.wallet) throw new Error('Wallet not initialized');
+    if (!this.twakAdapter) throw new Error('TWAK adapter not initialized');
     const provider = this.engine.getProvider();
     if (!provider) throw new Error('Provider not initialized');
 
@@ -294,47 +290,28 @@ export class ExecutionService {
 
     try {
       await prev; // wait for any in-flight send to finish fetching + using its nonce
-      const signer      = this.wallet.connect(provider);
       const gasPriceWei = ethers.parseUnits(gasPrice.toFixed(9), 'gwei');
-      const nonce       = await signer.getNonce('pending');
+      const { chainId } = await provider.getNetwork();
+      const nonce       = await provider.getTransactionCount(this.twakAdapter.getAddress(), 'pending');
 
-      // Wrap sendTransaction in a race against a timeout so a hung RPC node
-      // never permanently stalls the nonce lock. Without this, a sendTransaction
+      const unsignedTx = ethers.Transaction.from({
+        to, data: calldata, value, gasPrice: gasPriceWei, gasLimit, nonce, chainId,
+      });
+      const signedHex = await this.twakAdapter.sign(unsignedTx.unsignedSerialized);
+
+      // Wrap broadcast in a race against a timeout so a hung RPC node
+      // never permanently stalls the nonce lock. Without this, a broadcast
       // that hangs (no response, no error) keeps resolveNonce() from ever being
       // called, blocking all subsequent transactions indefinitely.
       const sentTx = await Promise.race([
-        signer.sendTransaction({ to, data: calldata, value, gasPrice: gasPriceWei, gasLimit, nonce }),
+        provider.broadcastTransaction(signedHex),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`sendTransaction timeout after ${timeoutMs}ms`)), timeoutMs),
+          setTimeout(() => reject(new Error(`broadcastTransaction timeout after ${timeoutMs}ms`)), timeoutMs),
         ),
       ]);
-
       return sentTx.hash;
     } finally {
       resolveNonce();
     }
-  }
-
-  private async loadOrCreateWallet(): Promise<ethers.Wallet> {
-    const keyDir = path.dirname(WALLET_KEY_FILE);
-    await fs.promises.mkdir(keyDir, { recursive: true });
-
-    if (fs.existsSync(WALLET_KEY_FILE)) {
-      const privateKey = (await fs.promises.readFile(WALLET_KEY_FILE, 'utf8')).trim();
-      const wallet = new ethers.Wallet(privateKey);
-      logger.info('Loaded existing wallet', { address: wallet.address });
-      return wallet;
-    }
-
-    // createRandom() returns HDNodeWallet; extract a plain Wallet via the private key
-    const hdWallet = ethers.Wallet.createRandom();
-    const wallet   = new ethers.Wallet(hdWallet.privateKey);
-    await fs.promises.writeFile(WALLET_KEY_FILE, wallet.privateKey, { mode: 0o600 });
-    logger.info('Created new wallet', { address: wallet.address });
-    logger.warn('⚠️  NEW WALLET — fund this address with testnet BNB before live trading:', {
-      address: wallet.address,
-      faucet:  'https://testnet.bnbchain.org/faucet-smart',
-    });
-    return wallet;
   }
 }
