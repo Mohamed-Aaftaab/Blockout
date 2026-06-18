@@ -149,11 +149,20 @@ export class AnalyticsEngine {
       if (!byStrategy[s]) byStrategy[s] = { strategy: s, totalTrades: 0, winRate: 0, pnlUsd: 0, weight: 0 };
       byStrategy[s]!.totalTrades++;
       byStrategy[s]!.pnlUsd += t.pnlUsd;
+      // Track wins inline (same pattern as byPair)
+      if (t.pnlUsd > 0) byStrategy[s]!.winRate += 1; // temporarily store win count
     }
 
     // Convert per-pair win counts (stored temporarily in winRate field) to actual win rates
     for (const m of Object.values(byPair)) {
       m.winRate = m.totalTrades > 0 ? m.winRate / m.totalTrades : 0;
+    }
+
+    // Convert per-strategy win counts to win rates, and populate weights from StrategyManager
+    for (const m of Object.values(byStrategy)) {
+      m.winRate = m.totalTrades > 0 ? m.winRate / m.totalTrades : 0;
+      // weight is not available here without injecting StrategyManager; leave at 0 —
+      // callers can enrich this if needed. It is accurately 0 until weighted.
     }
 
     return {

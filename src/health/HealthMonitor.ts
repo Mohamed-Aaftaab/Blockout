@@ -120,12 +120,15 @@ export class HealthMonitor {
     }
   }
 
-  // Called externally during startup to enforce init timeout
-  checkInitTimeout(component: string, timeoutMs: number): void {
-    setTimeout(() => {
+  // Called externally during startup to enforce init timeout.
+  // Returns a cancel function — call it on successful initialization to prevent
+  // the timeout from firing after init completes.
+  checkInitTimeout(component: string, timeoutMs: number): () => void {
+    const handle = setTimeout(() => {
       logger.error('Component initialization timed out', { component, timeoutMs });
       void this.triggerEmergencyShutdown(`init-timeout:${component}`);
     }, timeoutMs);
+    return () => clearTimeout(handle);
   }
 
   /** Periodic RPC liveness ping. Emits health:warning if the node is unreachable. */
@@ -145,7 +148,8 @@ export class HealthMonitor {
     }
   }
 
-  async attemptRecovery(component: string): Promise<boolean> {    logger.info('Attempting component recovery', { component });
+  async attemptRecovery(component: string): Promise<boolean> {
+    logger.info('Attempting component recovery', { component });
     try {
       // Stub: in production this would restart the component process/service
       await Promise.resolve();

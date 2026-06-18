@@ -93,14 +93,17 @@ async function bootstrap(): Promise<void> {
   // calls engine.setSigner() which calls requireProvider(). If both run concurrently via
   // Promise.all, executionSvc may call setSigner before the provider is connected.
   await tradingEngine.initialize();
-  // Set startup timeouts so a hung init step doesn't silently stall bootstrap.
-  // Both values are generous but bounded — well beyond normal BSC RPC latency.
+  // Set startup timeout so a hung ExecutionService.initialize() doesn't stall bootstrap
+  // indefinitely. The cancel function is called immediately on success so the timer
+  // never fires during normal operation — fixing the critical bug where the agent
+  // would unconditionally shut down 240s after startup.
   const INIT_TIMEOUT_MS = (cfg.txTimeoutSec * 1000) * 2; // 2× tx timeout (default 240s)
-  health.checkInitTimeout('ExecutionService', INIT_TIMEOUT_MS);
+  const cancelInitTimeout = health.checkInitTimeout('ExecutionService', INIT_TIMEOUT_MS);
   await Promise.all([
     executionSvc.initialize(),
     marketData.start(),
   ]);
+  cancelInitTimeout(); // ← cancel now that init succeeded; timer never fires again
 
   // ── [6] Supporting services ───────────────────────────────────────────────
   const analytics    = new AnalyticsEngine(stateMgr, configSvc, bus);
@@ -642,107 +645,113 @@ async function bootstrap(): Promise<void> {
   }, cfg.statePersistSec * 1000);
 
   // ── Graceful shutdown ─────────────────────────────────────────────────────
-  let shutdownInProgress = false;
-  let shutdownReason     = '';
+  // shutdownPromise serialises all shutdown calls — only one coroutine runs at a time.
+  // If a second call arrives (e.g. file-trigger after SIGTERM), it can escalate the
+  // reason if needed but never runs the teardown sequence twice.
+  let shutdownPromise: Promise<void> | null = null;
+  let shutdownReason  = '';
+  let shutdownIsEmergency = false;
 
-  const shutdown = async (reason: string): Promise<void> => {
-    if (shutdownInProgress) {
-      // If already shutting down via non-emergency (e.g. SIGTERM) but a file-trigger
-      // or circuit-breaker emergency now arrives, escalate to emergency close-all.
-      const isNewEmergency = reason === 'emergency' || reason === 'file-trigger';
-      const wasNonEmergency = shutdownReason !== 'emergency' && shutdownReason !== 'file-trigger';
-      if (isNewEmergency && wasNonEmergency && openPositionMap.size > 0) {
-        logger.warn('Escalating shutdown to emergency — closing all open positions', { reason });
-        shutdownReason = reason;
-        // Fall through to close-all below (shutdownInProgress already true, so skip the guard)
-      } else {
-        return;
+  const shutdown = (reason: string): Promise<void> => {
+    const isThisEmergency = reason === 'emergency' || reason === 'file-trigger';
+
+    if (shutdownPromise !== null) {
+      // Already shutting down. If this is an emergency escalation over a non-emergency
+      // first shutdown, record it so the close-all runs (if not already past that point).
+      if (isThisEmergency && !shutdownIsEmergency) {
+        logger.warn('Escalating shutdown to emergency', { reason, previous: shutdownReason });
+        shutdownIsEmergency = true;
+        shutdownReason      = reason;
       }
-    } else {
-      shutdownInProgress = true;
-      shutdownReason     = reason;
+      // Return the existing promise — callers await the same sequence.
+      return shutdownPromise;
+    }
+
+    shutdownReason      = reason;
+    shutdownIsEmergency = isThisEmergency;
+
+    shutdownPromise = (async () => {
       logger.info('Shutting down Blockout...', { reason });
+
+      // Stop the periodic save interval first — prevents it from racing with the final save.
       clearInterval(statePersistInterval);
-    }
 
-    // ── Fix U: Warn about any in-flight TWAP orders ───────────────────────────
-    // We cannot cancel on-chain transactions, but we log clearly so the operator
-    // knows to check their wallet for any partial fills.
-    if (activeTwapOrders.size > 0) {
-      logger.error('Shutdown requested while TWAP orders are in-flight — wallet may have untracked partial fills', {
-        activeTwapOrders: Object.fromEntries(activeTwapOrders),
-      });
-      bus.emit('health:critical', {
-        component: 'shutdown',
-        message:   `Shutdown with ${activeTwapOrders.size} active TWAP order(s). ` +
-                   `Check wallet for untracked tokens: ${[...activeTwapOrders.values()].join(', ')}`,
-        timestamp: Date.now(),
-      });
-    }
+      // ── Warn about any in-flight TWAP orders ──────────────────────────────
+      if (activeTwapOrders.size > 0) {
+        logger.error('Shutdown requested while TWAP orders are in-flight — wallet may have untracked partial fills', {
+          activeTwapOrders: Object.fromEntries(activeTwapOrders),
+        });
+        bus.emit('health:critical', {
+          component: 'shutdown',
+          message:   `Shutdown with ${activeTwapOrders.size} active TWAP order(s). ` +
+                     `Check wallet for untracked tokens: ${[...activeTwapOrders.values()].join(', ')}`,
+          timestamp: Date.now(),
+        });
+      }
 
-    // ── Emergency close-all open positions ────────────────────────────────────
-    const isEmergency = shutdownReason === 'emergency' || shutdownReason === 'file-trigger';
-    if (isEmergency && openPositionMap.size > 0) {
-      logger.warn('Emergency shutdown — attempting to close all open positions', {
-        count: openPositionMap.size,
-      });
-      // Snapshot the IDs before any async work — handlePositionClose deletes from the
-      // map on entry and may re-add on retry. Processing sequentially avoids two
-      // concurrent close attempts on the same position ID.
-      const positionIds = [...openPositionMap.keys()];
-      const closeTimeout = cfg.txTimeoutSec * 1000;
-      const started = Date.now();
-      for (const posId of positionIds) {
-        if (Date.now() - started >= closeTimeout) {
-          logger.warn('Emergency close-all timeout reached — remaining positions not closed', {
-            remaining: positionIds.length,
-          });
-          break;
-        }
-        const entry = openPositionMap.get(posId);
-        if (!entry) continue; // already closed by a concurrent SL/TP tick
-        try {
-          const exitPrice = await tradingEngine.getCurrentPrice(entry.position.pair);
-          if (exitPrice > 0) {
-            await handlePositionClose(posId, exitPrice, 'emergency');
-          } else {
-            logger.warn('Cannot close position — price unavailable at shutdown', {
-              positionId: posId, pair: entry.position.pair,
+      // ── Emergency close-all open positions ────────────────────────────────
+      // shutdownIsEmergency may have been flipped by an escalation above
+      if (shutdownIsEmergency && openPositionMap.size > 0) {
+        logger.warn('Emergency shutdown — attempting to close all open positions', {
+          count: openPositionMap.size,
+        });
+        // Snapshot IDs before any async work; process sequentially to avoid concurrent
+        // close attempts on the same position ID.
+        const positionIds  = [...openPositionMap.keys()];
+        const closeTimeout = cfg.txTimeoutSec * 1000;
+        const started      = Date.now();
+        for (const posId of positionIds) {
+          if (Date.now() - started >= closeTimeout) {
+            logger.warn('Emergency close-all timeout reached — remaining positions not closed');
+            break;
+          }
+          const entry = openPositionMap.get(posId);
+          if (!entry) continue; // already closed by a concurrent SL/TP tick
+          try {
+            const exitPrice = await tradingEngine.getCurrentPrice(entry.position.pair);
+            if (exitPrice > 0) {
+              await handlePositionClose(posId, exitPrice, 'emergency');
+            } else {
+              logger.warn('Cannot close position — price unavailable at shutdown', {
+                positionId: posId, pair: entry.position.pair,
+              });
+            }
+          } catch (e) {
+            logger.error('Failed to close position during emergency shutdown', {
+              positionId: posId, error: String(e),
             });
           }
-        } catch (e) {
-          logger.error('Failed to close position during emergency shutdown', {
-            positionId: posId, error: String(e),
-          });
         }
       }
-    }
 
-    stratMgr.stop();
-    riskMgr.stop();
-    analytics.stop();
-    regimeDet.stop();
-    marketData.stop();
-    health.stop();
-    tradingEngine.stop();
+      stratMgr.stop();
+      riskMgr.stop();
+      analytics.stop();
+      regimeDet.stop();
+      marketData.stop();
+      health.stop();
+      tradingEngine.stop();
 
-    logger.info(analytics.generateReport(isEmergency ? 'emergency' : 'shutdown'));
+      logger.info(analytics.generateReport(shutdownIsEmergency ? 'emergency' : 'shutdown'));
 
-    // Final state save via mutex to avoid racing with any in-flight operations
-    await stateMutex.run(async () => {
-      await stateMgr.saveState({
-        ...currentState,
-        drawdownBaseline:     riskMgr.getDrawdownBaseline(),
-        circuitBreakerActive: riskMgr.getCircuitBreakerActive(),
-        openPositions:        currentState.openPositions,
-        pendingTransactions:  [],
-        emergencyShutdown:    isEmergency,
-        lastRegimes:          regimeDet.getRegimes(),
+      // Final state save via mutex to avoid racing with any in-flight operations
+      await stateMutex.run(async () => {
+        await stateMgr.saveState({
+          ...currentState,
+          drawdownBaseline:     riskMgr.getDrawdownBaseline(),
+          circuitBreakerActive: riskMgr.getCircuitBreakerActive(),
+          openPositions:        currentState.openPositions,
+          pendingTransactions:  [],
+          emergencyShutdown:    shutdownIsEmergency,
+          lastRegimes:          regimeDet.getRegimes(),
+        });
       });
-    });
 
-    logger.info('Blockout shutdown complete');
-    process.exit(0);
+      logger.info('Blockout shutdown complete');
+      process.exit(0);
+    })();
+
+    return shutdownPromise;
   };
 
   bus.on('health:shutdown', ({ reason }) => { void shutdown(reason); });

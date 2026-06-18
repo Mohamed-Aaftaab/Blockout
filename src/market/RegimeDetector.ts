@@ -21,12 +21,18 @@ export class RegimeDetector {
 
   start(): void {
     const cfg = this.config.get();
-    // Periodic re-evaluation so regime stays current even during quiet market periods
-    // when no market:data events fire. detectRegime handles map updates and event emission.
+    // Periodic re-evaluation during quiet periods when CMC hasn't produced a fresh
+    // market:data event. detectRegime handles all map updates and event emission.
+    // In active markets this rarely fires — market:data runs every dataRefreshSec (60s)
+    // which is faster than updateIntervalSec (300s). In quiet periods it ensures the
+    // regime doesn't go stale even if CMC has no new data.
     this.intervalHandle = setInterval(() => {
       for (const pair of cfg.tradingPairs) {
         const data = this.marketData.getLatestData(pair);
         if (data === null) continue;
+        // Only re-evaluate if data is stale (older than updateIntervalSec / 2)
+        const staleThresholdMs = (cfg.regime.updateIntervalSec / 2) * 1000;
+        if (Date.now() - data.fetchedAt < staleThresholdMs) continue; // fresh data → skip
         this.detectRegime(pair, data);
       }
     }, cfg.regime.updateIntervalSec * 1000);

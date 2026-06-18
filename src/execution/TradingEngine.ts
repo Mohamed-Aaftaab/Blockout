@@ -243,7 +243,9 @@ export class TradingEngine {
       inputIsNative:  boolean,
     ): Promise<bigint> => {
       try {
-        const amounts = await router.getFunction('getAmountsOut')(amountIn, swapPath) as bigint[];
+        const amounts = await this.withRpcTimeout(
+          router.getFunction('getAmountsOut')(amountIn, swapPath) as Promise<bigint[]>
+        );
         const expectedOut = amounts[amounts.length - 1] ?? 0n;
         if (expectedOut === 0n) throw new Error('zero expected output');
         return (expectedOut * BigInt(10000 - slippageBps)) / BigInt(10000);
@@ -347,24 +349,28 @@ export class TradingEngine {
       }
     }
 
-    // Estimate gas for the swap
+    // Estimate gas for the swap — wrapped in rpcTimeoutMs to prevent stalling the nonce lock
     let gasLimit = 300_000n;
     try {
       if (this.wallet) {
         const signer = this.wallet.connect(provider);
-        gasLimit = await signer.estimateGas({ to: cfg.venue.pancakeswapRouter, data: calldata, value });
-        gasLimit = (gasLimit * 120n) / 100n;
+        const estimated = await this.withRpcTimeout(
+          signer.estimateGas({ to: cfg.venue.pancakeswapRouter, data: calldata, value })
+        );
+        gasLimit = (estimated * 120n) / 100n;
       }
     } catch {
       gasLimit = 300_000n;
     }
 
-    // Build approve tx if ERC-20 input token needs allowance
+    // Build approve tx if ERC-20 input token needs allowance — wrapped in rpcTimeoutMs
     let approveTx: SwapPlan['approveTx'] = null;
     if (spendToken !== null && this.wallet !== null) {
       try {
         const erc20     = new ethers.Contract(spendToken, ERC20_ABI, provider);
-        const allowance = await erc20.getFunction('allowance')(this.wallet.address, cfg.venue.pancakeswapRouter) as bigint;
+        const allowance = await this.withRpcTimeout(
+          erc20.getFunction('allowance')(this.wallet.address, cfg.venue.pancakeswapRouter) as Promise<bigint>
+        );
         // Use the actual spend amount (in the spend token's decimals) for comparison
         if (allowance < spendAmountWei) {
           const approveIface = new ethers.Interface(ERC20_ABI);
