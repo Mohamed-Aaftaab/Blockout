@@ -25,25 +25,42 @@ async function main(): Promise<void> {
   }
 
   const state = stateResult.value;
+
+  // Already confirmed — nothing to do
   if (state.competitionRegistration?.confirmed) {
-    logger.info('Already registered', state.competitionRegistration);
+    logger.info('Already registered and confirmed on-chain', state.competitionRegistration);
     process.exit(0);
   }
 
+  // Submit (or re-check if already submitted but not yet confirmed)
   const result = await regSvc.register();
   if (!result.ok) {
     logger.error('Registration failed', { error: result.error.message });
     process.exit(1);
   }
 
-  const updated = { ...state, competitionRegistration: result.value };
-  await stateMgr.saveState(updated);
+  // Save immediately (confirmed: false if just submitted)
+  let reg = result.value;
+  await stateMgr.saveState({ ...state, competitionRegistration: reg });
+  logger.info('Registration tx submitted', { txHash: reg.txHash, wallet: reg.walletAddress });
 
-  logger.info(
-    'Registration submitted and saved to state. ' +
-    'Verify the tx on-chain, then set confirmed:true in state or re-run after on-chain confirmation is implemented.',
-  );
-  logger.info('Registration details:', result.value);
+  // Poll for on-chain confirmation (up to 2 minutes)
+  if (!reg.confirmed) {
+    logger.info('Waiting for on-chain confirmation...');
+    const confirmed = await regSvc.awaitConfirmation(120_000);
+    if (confirmed) {
+      reg = { ...reg, confirmed: true };
+      await stateMgr.saveState({ ...state, competitionRegistration: reg });
+      logger.info('Registration confirmed on-chain', reg);
+    } else {
+      logger.warn(
+        'Tx submitted but confirmation timed out after 2 minutes. ' +
+        'Re-run `npm run register` to recheck — the tx may still confirm.',
+      );
+    }
+  }
+
+  logger.info('Wallet address (fund this for trading):', { address: reg.walletAddress });
 }
 
 main().catch((e: unknown) => {

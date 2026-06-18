@@ -79,6 +79,7 @@ export interface AgentEvents {
   'health:shutdown':                [{ reason: string; timestamp: number }];
   'health:latency':                 [{ latencyMs: number; threshold: number }];
   'health:circuit_breaker_reset':   [{ timestamp: number }];
+  'health:daily_trades_warning':    [{ date: string; count: number; utcHour: number }];
 
   // Registration
   'registration:submitted': [CompetitionRegistration];

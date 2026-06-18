@@ -5,6 +5,7 @@ import type { Position, Order, Result } from '../types/index';
 import { ok, err }                   from '../types/index';
 import { RiskError }                 from '../types/errors';
 import type { TradingEngine }        from '../execution/TradingEngine';
+import { isPairEligible }            from '../config/eligible-tokens';
 
 const logger = makeLogger();
 
@@ -65,6 +66,11 @@ export class RiskManager {
   async validateNewPosition(order: Order, _openPositions: Position[]): Promise<Result<Order, RiskError>> {
     if (this.circuitBreakerActive) {
       return err(new RiskError('Circuit breaker active — trading halted', 'circuit_breaker'));
+    }
+
+    if (!isPairEligible(order.pair)) {
+      logger.warn('Order rejected: pair not in eligible token list — trade would not count toward scoring', { pair: order.pair });
+      return err(new RiskError(`Pair ${order.pair} is not in the competition eligible token list`, 'ineligible_token'));
     }
 
     const cfg          = this.config.get().risk;

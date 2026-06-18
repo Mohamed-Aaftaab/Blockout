@@ -8,21 +8,28 @@ jest.mock('node:child_process');
 
 const mockExecFile = execFile as jest.MockedFunction<typeof execFile>;
 
-function mockSuccess(stdout: string): void {
+// Sequence mocking: first call → status, subsequent calls → register output
+function mockSequence(outputs: string[]): void {
+  let i = 0;
   mockExecFile.mockImplementation(
-    (_f: string, _a: string[], cb: (...args: unknown[]) => void) => cb(null, stdout, ''),
+    (_f: string, _a: string[], _opts: unknown, cb: (...args: unknown[]) => void) =>
+      cb(null, outputs[i++] ?? '', ''),
   );
 }
 
 function mockFailure(msg: string): void {
   mockExecFile.mockImplementation(
-    (_f: string, _a: string[], cb: (...args: unknown[]) => void) => cb(new Error(msg), '', ''),
+    (_f: string, _a: string[], _opts: unknown, cb: (...args: unknown[]) => void) =>
+      cb(new Error(msg), '', ''),
   );
 }
 
 function buildSvc() {
   const mockConfig = {
-    get: jest.fn().mockReturnValue({ network: { mode: 'testnet' } }),
+    get: jest.fn().mockReturnValue({
+      network:            { mode: 'testnet' },
+      twakWalletPassword: 'test-password',
+    }),
   } as unknown as ConfigurationService;
   const mockBus = { emit: jest.fn() } as unknown as EventBus;
   return new RegistrationService(mockConfig, mockBus);
@@ -33,8 +40,12 @@ function buildSvc() {
 describe('RegistrationService.register', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  it('returns ok with txHash and walletAddress on success', async () => {
-    mockSuccess('{"txHash":"0xRegTx","walletAddress":"0xMyWallet"}\n');
+  it('returns ok with txHash and participant on success', async () => {
+    // status → not registered; register → success
+    mockSequence([
+      '{"registered":false,"participant":"0xMyWallet","open":true,"opensAt":"2026-06-01T00:00:00.000Z","deadline":"2026-06-25T00:00:00.000Z","secondsRemaining":100000,"chain":"bsc"}',
+      '{"txHash":"0xRegTx","participant":"0xMyWallet","chain":"bsc"}',
+    ]);
     const result = await buildSvc().register();
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -45,7 +56,21 @@ describe('RegistrationService.register', () => {
     }
   });
 
-  it('returns err when twak compete register fails', async () => {
+  it('skips registration and returns confirmed when already registered on-chain', async () => {
+    mockSequence([
+      '{"registered":true,"participant":"0xMyWallet","txHash":"0xExistingTx","open":true,"opensAt":"2026-06-01T00:00:00.000Z","deadline":"2026-06-25T00:00:00.000Z","secondsRemaining":100000,"chain":"bsc"}',
+    ]);
+    const result = await buildSvc().register();
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.confirmed).toBe(true);
+      expect(result.value.txHash).toBe('0xExistingTx');
+    }
+    // Should only call status, not register
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns err when twak compete register subprocess fails', async () => {
     mockFailure('registration failed: deadline passed');
     const result = await buildSvc().register();
     expect(result.ok).toBe(false);
@@ -54,12 +79,16 @@ describe('RegistrationService.register', () => {
     }
   });
 
-  it('calls twak with the correct competition contract address', async () => {
-    mockSuccess('{"txHash":"0xTx","walletAddress":"0xW"}\n');
+  it('calls twak compete register with --json and --password flags', async () => {
+    mockSequence([
+      '{"registered":false,"participant":"0xW","open":true,"opensAt":"2026-06-01T00:00:00.000Z","deadline":"2026-06-25T00:00:00.000Z","secondsRemaining":100000,"chain":"bsc"}',
+      '{"txHash":"0xTx","participant":"0xW","chain":"bsc"}',
+    ]);
     await buildSvc().register();
     expect(mockExecFile).toHaveBeenCalledWith(
       'twak',
-      expect.arrayContaining(['compete', 'register', '--contract', '0x212c61b9b72c95d95bf29cf032f5e5635629aed5']),
+      expect.arrayContaining(['compete', 'register', '--json']),
+      expect.any(Object),
       expect.any(Function),
     );
   });
@@ -69,7 +98,7 @@ describe('RegistrationService.register', () => {
 
 function stateWith(reg: SystemState['competitionRegistration']): SystemState {
   return {
-    version:                 '2.0.0',
+    version:                 '3.0.0',
     openPositions:           [],
     pendingTransactions:     [],
     drawdownBaseline:        0,
@@ -78,6 +107,7 @@ function stateWith(reg: SystemState['competitionRegistration']): SystemState {
     savedAt:                 Date.now(),
     checksum:                '',
     competitionRegistration: reg,
+    dailyTrades:             {},
   };
 }
 

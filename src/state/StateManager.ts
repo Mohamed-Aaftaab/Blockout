@@ -64,8 +64,10 @@ const SystemStateSchema = z.object({
   lastRegimes:             z.record(z.enum(['bull', 'bear', 'sideways'])).default({}),
   savedAt:                 z.number(),
   checksum:                z.string(),
-  // .default(null) handles old state files that predate this field
+  // .default(null) handles old state files that predate competitionRegistration (pre-v2)
   competitionRegistration: CompetitionRegistrationSchema.nullable().default(null),
+  // .default({}) handles old state files that predate dailyTrades (pre-v3)
+  dailyTrades:             z.record(z.string(), z.number()).default({}),
 }) as unknown as z.ZodType<SystemState>;
 
 // ─── StateManager ─────────────────────────────────────────────────────────────
@@ -159,7 +161,11 @@ export class StateManager {
       // the fact, so the stored checksum (computed without it) would never
       // match. The next saveState() will recompute and persist the new checksum.
       const rawObj = json as Record<string, unknown>;
-      const isMigratedState = !('competitionRegistration' in rawObj);
+      // Skip checksum for state files that predate a field addition (Zod fills defaults
+      // after the fact, so the stored checksum would never match the defaulted shape).
+      const isMigratedState =
+        !('competitionRegistration' in rawObj) ||
+        !('dailyTrades' in rawObj);
       if (!isMigratedState && !this.verifyChecksum(state)) {
         const msg = 'State file checksum mismatch — file may be corrupted';
         logger.error(msg, { path: filePath });
@@ -223,7 +229,7 @@ export class StateManager {
 
   emptyState(): SystemState {
     const blank: Omit<SystemState, 'checksum'> = {
-      version:                 '2.0.0',
+      version:                 '3.0.0',
       openPositions:           [],
       pendingTransactions:     [],
       drawdownBaseline:        0,
@@ -232,6 +238,7 @@ export class StateManager {
       lastRegimes:             {},
       savedAt:                 Date.now(),
       competitionRegistration: null,
+      dailyTrades:             {},
     };
     const checksum = this.computeChecksum(blank);
     return { ...blank, checksum };

@@ -5,8 +5,10 @@ import type { ConfigurationService } from '../config/index';
 import type { TradingEngine } from '../execution/TradingEngine';
 import type { GasOptimizer } from '../execution/GasOptimizer';
 import type { EventBus } from '../events/EventBus';
+import type { Order } from '../types/index';
 
 jest.mock('node:child_process');
+jest.mock('../utils/sleep', () => ({ sleep: jest.fn().mockResolvedValue(undefined) }));
 
 const mockExecFile = execFile as jest.MockedFunction<typeof execFile>;
 
@@ -134,5 +136,83 @@ describe('ExecutionService TWAK wiring', () => {
     const svc = buildExecService();
     await svc.initialize();
     expect(svc.getWalletAddress()).toBe('0xTWAKAddress');
+  });
+});
+
+// ─── executeOrder signs every transaction via TWAKAdapter.sign ────────────────
+
+describe('ExecutionService.executeOrder calls TWAKAdapter.sign', () => {
+  // Valid PancakeSwap V2 Router address — required by ethers.Transaction.from()
+  const ROUTER_ADDR = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+  const SIGNED_HEX  = '0xdeadbeefcafebabe';
+
+  function buildSigningExecService() {
+    const mockProvider = {
+      getNetwork:            jest.fn().mockResolvedValue({ chainId: 97n }),
+      getTransactionCount:   jest.fn().mockResolvedValue(0),
+      broadcastTransaction:  jest.fn().mockResolvedValue({ hash: '0xTxHash' }),
+      getTransactionReceipt: jest.fn().mockResolvedValue({ status: 1, gasUsed: 150_000n, blockNumber: 12345 }),
+    };
+    const mockEngine = {
+      getProvider:             jest.fn().mockReturnValue(mockProvider),
+      setSigner:               jest.fn(),
+      buildSwapPlan:           jest.fn().mockResolvedValue({
+        approveTx: null,
+        swapTx:    { to: ROUTER_ADDR, calldata: '0xdeadbeef', value: 0n, gasLimit: 300_000 },
+      }),
+      routeOrder:              jest.fn(),
+      invalidatePortfolioCache: jest.fn(),
+      getPortfolioValue:       jest.fn().mockResolvedValue(0),
+      getBaseTokenBalanceUsd:  jest.fn().mockResolvedValue(0),
+    } as unknown as TradingEngine;
+    const mockGas = {
+      getOptimalGasPrice: jest.fn().mockResolvedValue(5),
+    } as unknown as GasOptimizer;
+    const mockConfig = {
+      get: jest.fn().mockReturnValue({
+        network:     { mode: 'testnet' },
+        gas:         { maxRetries: 0, maxGasGwei: 20, gasBumpPct: 20 },
+        slippage:    { defaultPct: 1.5, maxPct: 5, bumpPct: 0.5 },
+        txTimeoutSec: 30,
+      }),
+    } as unknown as ConfigurationService;
+    const mockBus = { emit: jest.fn() } as unknown as EventBus;
+    return { svc: new ExecutionService(mockEngine, mockGas, mockConfig, mockBus), mockProvider };
+  }
+
+  beforeEach(() => jest.clearAllMocks());
+
+  it('sign() is called for every order submitted via PancakeSwap', async () => {
+    // execFile call sequence: --version, wallet address, sign --raw <hex>
+    mockTwakSuccess(['1.0.0\n', '0xWallet\n', SIGNED_HEX + '\n']);
+    const { svc, mockProvider } = buildSigningExecService();
+    await svc.initialize();
+
+    const order: Order = {
+      id:        'test-order-1',
+      pair:      'BNB/USDT',
+      type:      'market',
+      side:      'buy',
+      size:      100,
+      venue:     'pancakeswap',
+      slippage:  1.5,
+      twap:      null,
+      createdAt: Date.now(),
+      signalId:  'sig-1',
+    };
+
+    const result = await svc.executeOrder(order);
+
+    // sign subprocess must have been called with the unsigned serialized tx
+    expect(mockExecFile).toHaveBeenCalledWith(
+      'twak',
+      ['sign', '--raw', expect.any(String)],
+      expect.any(Function),
+    );
+
+    // broadcastTransaction must receive exactly what TWAK returned
+    expect(mockProvider.broadcastTransaction).toHaveBeenCalledWith(SIGNED_HEX);
+
+    expect(result.ok).toBe(true);
   });
 });

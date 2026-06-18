@@ -304,6 +304,8 @@ export interface SystemState {
   savedAt:                  number;
   checksum:                 string;
   competitionRegistration:  CompetitionRegistration | null;
+  /** UTC date (YYYY-MM-DD) → confirmed trade count. Resets each calendar day. */
+  dailyTrades:              Record<string, number>;
 }
 
 // ─── Performance Metrics ─────────────────────────────────────────────────────
