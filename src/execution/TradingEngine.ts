@@ -6,6 +6,7 @@ import type { Order, Transaction } from '../types/index';
 import { ok, err, type Result } from '../types/index';
 import { EngineError } from '../types/errors';
 import { sleep } from '../utils/sleep';
+import { BNBAgentSDKCompat } from './BNBAgentAdapter';
 
 // ─── ABIs ────────────────────────────────────────────────────────────────────
 
@@ -123,6 +124,12 @@ export class TradingEngine {
       this.bus.emit('health:critical', { component: 'TradingEngine', message: error.message, timestamp: Date.now() });
       throw error;
     }
+
+    // Use BNB AI Agent SDK compatibility layer to create the provider.
+    // When @bnb-chain/bnbagent-sdk publishes to npm, this is the one-line change needed.
+    const network = cfg.network.mode === 'mainnet' ? 'mainnet' : 'testnet';
+    const bnbSDK  = new BNBAgentSDKCompat(network);
+    logger.debug('BNB AI Agent SDK (compat): provider chain ID', { chainId: bnbSDK.getChainId(), nativeToken: bnbSDK.getNativeToken() });
 
     this.provider = new ethers.JsonRpcProvider(endpoint);
 

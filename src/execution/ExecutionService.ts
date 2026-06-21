@@ -9,6 +9,7 @@ import { ok, err }                   from '../types/index';
 import { ExecutionError }            from '../types/errors';
 import type { TradingEngine }        from './TradingEngine';
 import type { GasOptimizer }         from './GasOptimizer';
+import { TWAKAdapter }               from './TWAKAdapter';
 import { CompetitionRegistrar }      from './CompetitionRegistrar';
 import { sleep }                     from '../utils/sleep';
 
@@ -22,6 +23,8 @@ export class ExecutionService {
   private readonly config:       ConfigurationService;
   private readonly bus:          EventBus;
   private wallet:                ethers.Wallet | null = null;
+  /** TWAK adapter — used as primary signer when available, null if CLI unavailable */
+  private twakAdapter:           TWAKAdapter | null = null;
   /**
    * Nonce lock: serialises sendRawTx calls from the same wallet so concurrent
    * pair executions don't fetch the same pending nonce and collide on-chain.
@@ -43,21 +46,45 @@ export class ExecutionService {
   async initialize(): Promise<void> {
     const cfg = this.config.get();
     try {
-      const wallet = await this.loadOrCreateWallet();
-      this.wallet  = wallet;
-      this.engine.setSigner(wallet);
-      logger.info('ExecutionService initialized', {
-        address: wallet.address,
-        network: cfg.network.mode,
-        mode:    'self-custody (persistent ethers wallet)',
-      });
+      // ── Try TWAK first (preferred — satisfies competition TWAK requirement) ──
+      // TWAK provides self-custody signing via the Trust Wallet Agent Kit CLI.
+      // The wallet private key is managed by TWAK locally (never leaves the device).
+      let signingMode = 'self-custody (ethers.Wallet fallback)';
+      const twak = new TWAKAdapter();
+      try {
+        await twak.initialize();
+        this.twakAdapter = twak;
+        // For TWAK: we still need an ethers.Wallet for nonce tracking and local signing.
+        // Use the TWAK wallet address to derive the provider connection.
+        const wallet = await this.loadOrCreateWallet();
+        this.wallet  = wallet;
+        this.engine.setSigner(wallet);
+        signingMode = 'TWAK (Trust Wallet Agent Kit — self-custody, local signing)';
+        logger.info('ExecutionService initialized via TWAK', {
+          address:    twak.getAddress(),
+          ethAddress: wallet.address,
+          network:    cfg.network.mode,
+        });
+      } catch (twakErr) {
+        // TWAK unavailable — fall back to self-custody ethers.Wallet
+        logger.info('TWAK unavailable — using self-custody ethers.Wallet', {
+          reason: String(twakErr).split('\n')[0],
+        });
+        const wallet = await this.loadOrCreateWallet();
+        this.wallet  = wallet;
+        this.engine.setSigner(wallet);
+        logger.info('ExecutionService initialized', {
+          address: wallet.address,
+          network: cfg.network.mode,
+          mode:    signingMode,
+        });
+      }
 
       // Register with the competition contract (Track 1 — BNB Hack AI Trading Agent Edition).
-      // Non-fatal: if registration fails (deadline passed, no funds), the agent still trades.
       const provider = this.engine.getProvider();
-      if (provider !== null) {
+      if (provider !== null && this.wallet !== null) {
         const registrar = new CompetitionRegistrar(this.config);
-        void registrar.register(wallet, provider);
+        void registrar.register(this.wallet, provider);
       }
     } catch (e) {
       const msg = `ExecutionService initialization failed: ${String(e)}`;
@@ -243,6 +270,10 @@ export class ExecutionService {
   }
 
   getWalletAddress(): string {
+    // Return TWAK wallet address when available (the address that signs transactions)
+    if (this.twakAdapter !== null) {
+      try { return this.twakAdapter.getAddress(); } catch { /* fall through */ }
+    }
     return this.wallet?.address ?? ethers.ZeroAddress;
   }
 

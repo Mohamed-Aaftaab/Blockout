@@ -60,7 +60,7 @@ describe('TWAKAdapter.initialize', () => {
   });
 
   it('sets address and resolves when twak is available', async () => {
-    mockTwakSuccess(['1.0.0\n', '0xDeAdBeEf1234\n']);
+    mockTwakSuccess(['1.0.0\n', JSON.stringify({ address: '0xDeAdBeEf1234' }) + '\n']);
     const adapter = new TWAKAdapter();
     await adapter.initialize();
     expect(adapter.getAddress()).toBe('0xDeAdBeEf1234');
@@ -71,14 +71,15 @@ describe('TWAKAdapter.sign', () => {
   beforeEach(() => jest.clearAllMocks());
 
   it('passes --raw flag and returns signed hex', async () => {
-    mockTwakSuccess(['1.0.0\n', '0xWallet\n', '0xSignedTxHex\n']);
+    mockTwakSuccess(['1.0.0\n', JSON.stringify({ address: '0xWallet' }) + '\n', JSON.stringify({ signature: '0xSignedTxHex' }) + '\n']);
     const adapter = new TWAKAdapter();
     await adapter.initialize();
     const result = await adapter.sign('0xUnsignedTxHex');
     expect(result).toBe('0xSignedTxHex');
+    // TWAK CLI is invoked via npx @trustwallet/cli
     expect(mockExecFile).toHaveBeenCalledWith(
-      'twak',
-      ['sign', '--raw', '0xUnsignedTxHex'],
+      'npx',
+      expect.arrayContaining(['@trustwallet/cli', 'wallet', 'sign-message']),
       expect.any(Function),
     );
   });
@@ -89,7 +90,7 @@ describe('TWAKAdapter.sign', () => {
         cb(null, '1.0.0\n', ''),
       )
       .mockImplementationOnce((_f: string, _a: string[], cb: (...a: unknown[]) => void) =>
-        cb(null, '0xWallet\n', ''),
+        cb(null, JSON.stringify({ address: '0xWallet' }) + '\n', ''),
       )
       .mockImplementationOnce((_f: string, _a: string[], cb: (...a: unknown[]) => void) =>
         cb(new Error('sign failed'), '', ''),
