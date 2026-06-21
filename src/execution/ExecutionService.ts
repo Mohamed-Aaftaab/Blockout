@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import * as fs    from 'fs';
 import * as path  from 'path';
+import { execFile } from 'node:child_process';
 import { makeLogger } from '../utils/logger';
 import type { ConfigurationService } from '../config/index';
 import type { EventBus }             from '../events/EventBus';
@@ -80,12 +81,11 @@ export class ExecutionService {
         });
       }
 
-      // Register with the competition contract (Track 1 — BNB Hack AI Trading Agent Edition).
-      const provider = this.engine.getProvider();
-      if (provider !== null && this.wallet !== null) {
-        const registrar = new CompetitionRegistrar(this.config);
-        void registrar.register(this.wallet, provider);
-      }
+      // Register with the competition contract via TWAK CLI.
+      // twak compete register resolves the TWAK wallet address and submits the
+      // registration tx on the participant's behalf — official Track 1 method.
+      // We trigger this on startup; if gas is unavailable it logs and continues.
+      void this.registerForCompetition();
     } catch (e) {
       const msg = `ExecutionService initialization failed: ${String(e)}`;
       this.bus.emit('health:critical', { component: 'ExecutionService', message: msg, timestamp: Date.now() });
@@ -351,6 +351,57 @@ export class ExecutionService {
     } finally {
       resolveNonce();
     }
+  }
+
+  /**
+   * Register the TWAK agent wallet for Track 1 of BNB Hack AI Trading Agent Edition
+   * using the official `twak compete register` CLI command.
+   * This is the correct registration method — it resolves the wallet address and
+   * submits the tx to competition contract 0x212c61b9b72c95d95bf29cf032f5e5635629aed5.
+   * Non-fatal: logs and continues if gas is unavailable or deadline has passed.
+   */
+  private async registerForCompetition(): Promise<void> {
+    return new Promise((resolve) => {
+      const args = [
+        '@trustwallet/cli', 'compete', 'register',
+        '--password', process.env['TWAK_WALLET_PASSWORD'] ?? '',
+        '--json',
+      ];
+      execFile('npx', args, (err, stdout, stderr) => {
+        if (err) {
+          const errMsg = stderr || String(err);
+          if (errMsg.includes('insufficient funds') || errMsg.includes('have 0')) {
+            logger.warn('Competition registration: wallet needs tBNB for gas. Fund wallet and restart.', {
+              wallet: this.getWalletAddress(),
+            });
+          } else if (errMsg.includes('deadline') || errMsg.includes('rejected')) {
+            logger.warn('Competition registration: deadline has passed — already registered or too late', {
+              output: errMsg.slice(0, 200),
+            });
+          } else {
+            logger.warn('Competition registration failed (non-fatal)', { error: errMsg.slice(0, 200) });
+          }
+          resolve();
+          return;
+        }
+        try {
+          const result = JSON.parse(stdout) as Record<string, unknown>;
+          if (result['txHash'] ?? result['transactionHash']) {
+            logger.info('✅ Competition registration submitted via twak compete register', {
+              txHash: result['txHash'] ?? result['transactionHash'],
+              wallet: this.getWalletAddress(),
+            });
+          } else if (result['status'] === 'already_registered' || result['registered'] === true) {
+            logger.info('Competition registration: already registered', { wallet: this.getWalletAddress() });
+          } else {
+            logger.info('Competition registration result', { result: stdout.slice(0, 300) });
+          }
+        } catch {
+          logger.info('Competition registration output', { output: stdout.slice(0, 300) });
+        }
+        resolve();
+      });
+    });
   }
 
   private async loadOrCreateWallet(): Promise<ethers.Wallet> {
