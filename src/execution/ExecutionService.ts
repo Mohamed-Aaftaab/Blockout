@@ -9,6 +9,7 @@ import { ok, err }                   from '../types/index';
 import { ExecutionError }            from '../types/errors';
 import type { TradingEngine }        from './TradingEngine';
 import type { GasOptimizer }         from './GasOptimizer';
+import { CompetitionRegistrar }      from './CompetitionRegistrar';
 import { sleep }                     from '../utils/sleep';
 
 const WALLET_KEY_FILE = './data/wallet.key';
@@ -50,6 +51,14 @@ export class ExecutionService {
         network: cfg.network.mode,
         mode:    'self-custody (persistent ethers wallet)',
       });
+
+      // Register with the competition contract (Track 1 — BNB Hack AI Trading Agent Edition).
+      // Non-fatal: if registration fails (deadline passed, no funds), the agent still trades.
+      const provider = this.engine.getProvider();
+      if (provider !== null) {
+        const registrar = new CompetitionRegistrar(this.config);
+        void registrar.register(wallet, provider);
+      }
     } catch (e) {
       const msg = `ExecutionService initialization failed: ${String(e)}`;
       this.bus.emit('health:critical', { component: 'ExecutionService', message: msg, timestamp: Date.now() });

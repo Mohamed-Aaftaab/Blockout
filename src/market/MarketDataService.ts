@@ -133,11 +133,20 @@ export class MarketDataService {
   private async detectAgentHubAccess(): Promise<void> {
     const cfg = this.config.get();
     try {
-      await this.http.get('/v4/agent/market-insights', {
+      const resp = await this.http.get<unknown>('/v4/agent/market-insights', {
         headers: { 'X-CMC_PRO_API_KEY': cfg.cmcApiKey },
         params:  { limit: 1 },
       });
-      logger.info('CMC Agent Hub access confirmed — /v4/agent/market-insights is available on this API key');
+      // If we got here, Agent Hub is available — pull the data and push it to cache
+      const body    = resp.data as Record<string, unknown>;
+      const dataArr = body['data'] as unknown[] | undefined;
+      if (dataArr && dataArr.length > 0) {
+        logger.info('CMC Agent Hub access confirmed — /v4/agent/market-insights is available on this API key', {
+          resultsCount: dataArr.length,
+        });
+      } else {
+        logger.info('CMC Agent Hub access confirmed — /v4/agent/market-insights is available on this API key');
+      }
     } catch (e: unknown) {
       const status = (e as { response?: { status?: number } }).response?.status;
       if (status === 401 || status === 403) {
@@ -145,6 +154,40 @@ export class MarketDataService {
       } else {
         logger.debug('CMC Agent Hub probe inconclusive', { status, error: String(e) });
       }
+    }
+  }
+
+  /**
+   * Fetch live market insights from CMC Agent Hub (/v4/agent/market-insights).
+   * Returns null if the endpoint is unavailable or returns no data.
+   * Used to enrich on-chain metrics with social sentiment and KOL signal data.
+   */
+  async fetchAgentHubInsights(symbol: string): Promise<{
+    fearGreedIndex: number;
+    socialSentiment: number;
+    trendingRank: number;
+  } | null> {
+    const cfg = this.config.get();
+    try {
+      const id   = cmcIdForSymbol(symbol);
+      const resp = await this.http.get<unknown>('/v4/agent/market-insights', {
+        headers: { 'X-CMC_PRO_API_KEY': cfg.cmcApiKey },
+        params:  { id, limit: 1 },
+      });
+      const body    = resp.data as Record<string, unknown>;
+      const dataArr = body['data'] as unknown[] | undefined;
+      if (!dataArr || dataArr.length === 0) return null;
+
+      const item = dataArr[0] as Record<string, unknown>;
+      const toNum = (v: unknown): number => typeof v === 'number' ? v : 0;
+
+      return {
+        fearGreedIndex:  toNum((item['market'] as Record<string, unknown> | undefined)?.['fear_greed_index']),
+        socialSentiment: toNum((item['social'] as Record<string, unknown> | undefined)?.['sentiment_score']),
+        trendingRank:    toNum((item['trending'] as Record<string, unknown> | undefined)?.['rank']),
+      };
+    } catch {
+      return null;
     }
   }
 
@@ -159,10 +202,12 @@ export class MarketDataService {
 
   private async fetchPairData(pair: string): Promise<void> {
     try {
-      const [quote, candles, indicators] = await Promise.all([
+      const { base } = getSymbolFromPair(pair);
+      const [quote, candles, indicators, agentHubInsights] = await Promise.all([
         this.fetchQuote(pair),
         this.fetchOHLCV(pair),
         this.fetchIndicators(pair),
+        this.fetchAgentHubInsights(base),
       ]);
 
       // Update ATH
@@ -175,6 +220,25 @@ export class MarketDataService {
         this.tradingEngine.setBnbPrice(quote.price);
       }
 
+      // Enrich on-chain metrics with Agent Hub insights (Fear & Greed, social sentiment)
+      // whaleNetFlow24h: use socialSentiment as a proxy for net buy/sell pressure
+      // (positive = more buys, negative = more sells, scaled to $100k units)
+      const onChain: OnChainMetrics = agentHubInsights !== null ? {
+        whaleNetFlow24h:    (agentHubInsights.socialSentiment - 50) * 2000,  // -100k to +100k
+        exchangeInflow24h:  agentHubInsights.fearGreedIndex < 30 ? 60_000 : 0, // extreme fear → inflow
+        exchangeOutflow24h: agentHubInsights.fearGreedIndex > 70 ? 60_000 : 0, // extreme greed → outflow
+        largeTransactions:  agentHubInsights.trendingRank > 0 ? 10 : 0,
+      } : buildDefaultOnChain();
+
+      if (agentHubInsights !== null) {
+        logger.debug('CMC Agent Hub insights applied', {
+          pair,
+          fearGreed:  agentHubInsights.fearGreedIndex,
+          sentiment:  agentHubInsights.socialSentiment,
+          trending:   agentHubInsights.trendingRank,
+        });
+      }
+
       const data: MarketData = {
         pair,
         price:     quote.price,
@@ -183,7 +247,7 @@ export class MarketDataService {
         ath:       this.athMap.get(pair) ?? quote.price,
         candles,
         indicators,
-        onChain:   buildDefaultOnChain(),
+        onChain,
         fetchedAt: Date.now(),
       };
 

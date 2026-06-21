@@ -1,0 +1,233 @@
+{
+  "name": "Blockout Trading Skill",
+  "version": "1.0.0",
+  "description": "A multi-signal regime-aware trading strategy Skill for BNB Chain. Combines RSI, MACD, Bollinger Bands, CMC Fear & Greed Index, and social sentiment from the CoinMarketCap AI Agent Hub into a composite signal with regime detection (bull/bear/sideways). Designed for backtesting on BSC tokens using CMC historical OHLCV and indicator data.",
+  "author": "Blockout",
+  "track": "Track 2 — Strategy Skills",
+  "hackathon": "BNB Hack: AI Trading Agent Edition ⚡️ CoinMarketCap × Trust Wallet",
+  "data_sources": [
+    {
+      "name": "CoinMarketCap Pro API",
+      "endpoints": [
+        "GET /v2/cryptocurrency/quotes/latest",
+        "GET /v2/cryptocurrency/ohlcv/historical",
+        "GET /v3/cryptocurrency/technical-indicator/latest",
+        "GET /v4/agent/market-insights"
+      ],
+      "usage": "Real-time price, OHLCV candles (100 hourly), RSI-14, MACD, Bollinger Bands, Fear & Greed index, social sentiment score, and trending rank"
+    }
+  ],
+  "parameters": {
+    "rsi_oversold": {
+      "type": "integer",
+      "default": 30,
+      "range": [10, 45],
+      "description": "RSI-14 threshold below which a buy signal is generated"
+    },
+    "rsi_overbought": {
+      "type": "integer",
+      "default": 70,
+      "range": [55, 90],
+      "description": "RSI-14 threshold above which a sell signal is generated"
+    },
+    "bb_width_threshold": {
+      "type": "number",
+      "default": 6,
+      "range": [1, 20],
+      "description": "Bollinger Band width below which market is classified as sideways"
+    },
+    "ma_slope_threshold": {
+      "type": "number",
+      "default": 0.001,
+      "range": [0.0001, 0.01],
+      "description": "MA-20 slope threshold for bull/bear regime classification"
+    },
+    "ath_drop_pct": {
+      "type": "number",
+      "default": 10,
+      "range": [5, 30],
+      "description": "Percentage drop from session ATH that triggers MidBattle scalping entry"
+    },
+    "stop_loss_pct": {
+      "type": "number",
+      "default": 5,
+      "range": [1, 20],
+      "description": "Stop-loss distance as % from entry price"
+    },
+    "take_profit_pct": {
+      "type": "number",
+      "default": 15,
+      "range": [5, 50],
+      "description": "Take-profit distance as % from entry price"
+    },
+    "max_drawdown_pct": {
+      "type": "number",
+      "default": 20,
+      "range": [5, 40],
+      "description": "Maximum portfolio drawdown before circuit breaker halts trading"
+    },
+    "fear_greed_buy_threshold": {
+      "type": "integer",
+      "default": 30,
+      "range": [10, 50],
+      "description": "Fear & Greed index below which fear regime amplifies buy signals"
+    },
+    "fear_greed_sell_threshold": {
+      "type": "integer",
+      "default": 70,
+      "range": [50, 90],
+      "description": "Fear & Greed index above which greed regime amplifies sell signals"
+    }
+  },
+  "regime_detection": {
+    "description": "Classifies market into bull/bear/sideways using Bollinger Band width and MA-20 slope vs MA-50",
+    "logic": {
+      "sideways": "BB width < bb_width_threshold OR ma50 == 0 (indicators unavailable)",
+      "bull": "MA-20 slope > ma_slope_threshold AND price > MA-50",
+      "bear": "MA-20 slope < -ma_slope_threshold AND price < MA-50"
+    }
+  },
+  "signals": [
+    {
+      "name": "RSI Oversold",
+      "type": "rsi_oversold",
+      "side": "buy",
+      "condition": "rsi14 < rsi_oversold",
+      "confidence_formula": "(rsi_oversold - rsi14) / rsi_oversold",
+      "active_regimes": ["bear", "sideways"],
+      "weight": 0.25
+    },
+    {
+      "name": "RSI Overbought",
+      "type": "rsi_overbought",
+      "side": "sell",
+      "condition": "rsi14 > rsi_overbought",
+      "confidence_formula": "(rsi14 - rsi_overbought) / (100 - rsi_overbought)",
+      "active_regimes": ["bull", "sideways"],
+      "weight": 0.25
+    },
+    {
+      "name": "MACD Bullish Cross",
+      "type": "macd_bullish",
+      "side": "buy",
+      "condition": "macd_line > macd_signal AND macd_histogram > 0",
+      "confidence_formula": "min(abs(macd_histogram) / 10, 1.0)",
+      "active_regimes": ["bull"],
+      "weight": 0.25
+    },
+    {
+      "name": "MACD Bearish Cross",
+      "type": "macd_bearish",
+      "side": "sell",
+      "condition": "macd_line < macd_signal AND macd_histogram < 0",
+      "confidence_formula": "min(abs(macd_histogram) / 10, 1.0)",
+      "active_regimes": ["bear"],
+      "weight": 0.25
+    },
+    {
+      "name": "Bollinger Lower Band",
+      "type": "bb_lower",
+      "side": "buy",
+      "condition": "price <= bb_lower AND bb_band_width > 0",
+      "confidence_formula": "min((bb_lower - price) / bb_band_width + 0.5, 1.0)",
+      "active_regimes": ["sideways", "bear"],
+      "weight": 0.20
+    },
+    {
+      "name": "Bollinger Upper Band",
+      "type": "bb_upper",
+      "side": "sell",
+      "condition": "price >= bb_upper AND bb_band_width > 0",
+      "confidence_formula": "min((price - bb_upper) / bb_band_width + 0.5, 1.0)",
+      "active_regimes": ["sideways", "bull"],
+      "weight": 0.20
+    },
+    {
+      "name": "CMC Fear & Greed Buy",
+      "type": "whale_accumulation",
+      "side": "buy",
+      "condition": "fear_greed_index < fear_greed_buy_threshold",
+      "confidence_formula": "min((fear_greed_buy_threshold - fear_greed_index) / fear_greed_buy_threshold, 1.0)",
+      "data_source": "CMC Agent Hub /v4/agent/market-insights",
+      "active_regimes": ["bear", "sideways"],
+      "weight": 0.15
+    },
+    {
+      "name": "CMC Greed Sell",
+      "type": "exchange_inflow",
+      "side": "sell",
+      "condition": "fear_greed_index > fear_greed_sell_threshold",
+      "confidence_formula": "min((fear_greed_index - fear_greed_sell_threshold) / (100 - fear_greed_sell_threshold), 1.0)",
+      "data_source": "CMC Agent Hub /v4/agent/market-insights",
+      "active_regimes": ["bull", "sideways"],
+      "weight": 0.15
+    },
+    {
+      "name": "Price Momentum Buy",
+      "type": "price_momentum_buy",
+      "side": "buy",
+      "condition": "price_change_pct_1h <= -2.0",
+      "confidence_formula": "min(abs(price_change_pct_1h) / 6.0, 1.0)",
+      "active_regimes": ["bull", "bear", "sideways"],
+      "weight": 0.20
+    },
+    {
+      "name": "Price Momentum Sell",
+      "type": "price_momentum_sell",
+      "side": "sell",
+      "condition": "price_change_pct_1h >= 2.0",
+      "confidence_formula": "min(price_change_pct_1h / 6.0, 1.0)",
+      "active_regimes": ["bull", "bear", "sideways"],
+      "weight": 0.20
+    },
+    {
+      "name": "MidBattle ATH Scalping",
+      "type": "scalping_entry",
+      "side": "buy",
+      "condition": "price <= session_ath * (1 - ath_drop_pct / 100)",
+      "confidence_formula": "1.0",
+      "active_regimes": ["bull", "bear", "sideways"],
+      "weight": 1.0,
+      "note": "Fires at any regime. Session ATH is the highest price since agent start."
+    }
+  ],
+  "composite_signal": {
+    "description": "Weighted confidence aggregation across active signals",
+    "formula": "composite_confidence = sum(signal.confidence * signal.weight) / sum(signal.weight)",
+    "side_resolution": "majority vote across active signals (tie → buy)",
+    "min_confidence_to_trade": 0.0,
+    "note": "Any non-zero confidence composite in the allowed regime triggers a position attempt"
+  },
+  "position_sizing": {
+    "method": "fixed_pct",
+    "size_pct_of_portfolio": 5,
+    "max_exposure_pct": 30,
+    "min_portfolio_usd": 10
+  },
+  "risk_management": {
+    "stop_loss": "entry * (1 - stop_loss_pct/100) for buys; entry * (1 + stop_loss_pct/100) for sells",
+    "take_profit": "entry * (1 + take_profit_pct/100) for buys; entry * (1 - take_profit_pct/100) for sells",
+    "circuit_breaker": "Halt all trading if portfolio drawdown from baseline >= max_drawdown_pct",
+    "mev_defense": "Orders above $50 are split into 10 randomized TWAP chunks (Anaconda Squeeze)"
+  },
+  "backtest_spec": {
+    "data_requirements": [
+      "CMC hourly OHLCV: /v2/cryptocurrency/ohlcv/historical (count=100, interval=1h)",
+      "CMC technical indicators: /v3/cryptocurrency/technical-indicator/latest",
+      "CMC Agent Hub Fear & Greed: /v4/agent/market-insights"
+    ],
+    "tokens": ["BNB", "CAKE"],
+    "suggested_period": "2025-01-01 to 2026-06-01",
+    "initial_capital_usd": 1000,
+    "transaction_cost_pct": 0.1,
+    "slippage_pct": 1.5
+  },
+  "live_execution": {
+    "chain": "BSC Testnet (Chain ID 97) / BSC Mainnet (Chain ID 56)",
+    "dex": "PancakeSwap V2",
+    "wallet": "self-custody ethers.Wallet (private key stored locally)",
+    "signing": "ethers.js v6 direct signing (TWAK CLI optional upgrade path)",
+    "competition_contract": "0x212c61b9b72c95d95bf29cf032f5e5635629aed5"
+  },
+  "llm_prompt_template": "You are a BSC trading agent using the Blockout strategy. Given the following market data for {symbol}:\n- Current price: {price}\n- RSI-14: {rsi14}\n- MACD: line={macd_line}, signal={macd_signal}, histogram={macd_histogram}\n- Bollinger Bands: upper={bb_upper}, middle={bb_middle}, lower={bb_lower}, width={bb_width}\n- MA20 slope: {ma20_slope}\n- Fear & Greed Index: {fear_greed}\n- Social Sentiment Score: {sentiment}\n- 1h price change: {price_change_pct}%\n- Session ATH: {session_ath}\n\nCurrent portfolio: ${portfolio_usd}\nOpen positions: {open_positions}\n\nApply the Blockout strategy:\n1. Determine regime (bull/bear/sideways) using BB width and MA slope\n2. Evaluate each signal for the current regime\n3. Compute composite confidence\n4. Decide: BUY, SELL, or HOLD\n5. Output: {action: 'buy'|'sell'|'hold', confidence: 0-1, reasoning: string}"
+}
