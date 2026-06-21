@@ -132,9 +132,7 @@ describe('ExecutionService initialization', () => {
     expect(svc.getWalletAddress()).toMatch(/^0x[0-9a-fA-F]{40}$/);
     // setSigner must have been called so TradingEngine can sign transactions
     expect(mockEngine.setSigner).toHaveBeenCalledTimes(1);
-    // Clean up created wallet file
-    const fs = await import('fs');
-    if (fs.existsSync(WALLET_KEY_FILE)) fs.unlinkSync(WALLET_KEY_FILE);
+    // NOTE: Do NOT delete data/wallet.key here — it is a live production file
   });
 
   it('getWalletAddress() returns ZeroAddress before initialize()', () => {
@@ -182,8 +180,8 @@ describe('ExecutionService.executeOrder submits via ethers.Wallet', () => {
 
   beforeEach(() => jest.clearAllMocks());
   afterEach(() => {
-    const fs = require('fs') as typeof import('fs');
-    if (fs.existsSync(WALLET_KEY_FILE)) fs.unlinkSync(WALLET_KEY_FILE);
+    // IMPORTANT: Do NOT delete data/wallet.key here — that is a production file.
+    // The tests use a separate temp path; nothing to clean up.
   });
 
   it('executeOrder returns err when provider has no real connection (expected in unit tests)', async () => {
